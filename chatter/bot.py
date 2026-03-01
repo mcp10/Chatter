@@ -158,8 +158,11 @@ def md_to_html(text: str) -> str:
                     for row in data_rows[1:]:
                         cells = [c.strip() for c in row.strip("|").split("|")]
                         lines = []
-                        for h, c in zip(headers, cells):
-                            lines.append(f"  {_html.escape(h)}: {_html.escape(c)}")
+                        for i, (h, c) in enumerate(zip(headers, cells)):
+                            if i == 0:
+                                lines.append(f"<b>{_html.escape(c)}</b>")
+                            else:
+                                lines.append(f"  {_html.escape(h)}: {_html.escape(c)}")
                         list_parts.append("\n".join(lines))
                     parts.append("\n\n".join(list_parts))
                 else:
