@@ -143,17 +143,40 @@ def md_to_html(text: str) -> str:
             parts.append(f"<pre><code>{code}</code></pre>")
             continue
 
-        # Split on inline code spans.
-        inline_segments = re.split(r"(`[^`]+`)", seg)
-        for part in inline_segments:
-            if part.startswith("`") and part.endswith("`") and len(part) > 1:
-                parts.append(f"<code>{_html.escape(part[1:-1])}</code>")
+        # Split on markdown tables (consecutive lines starting with |).
+        table_segments = re.split(r"(\n?\|[^\n]*\|(?:\n\|[^\n]*\|)+)", seg)
+        for tseg in table_segments:
+            if re.match(r"\n?\|", tseg) and tseg.strip().endswith("|"):
+                # Convert table to list format for readability on mobile.
+                data_rows = [
+                    line for line in tseg.strip().splitlines()
+                    if not re.match(r"^[\s|\-:]+$", line.strip())
+                ]
+                if len(data_rows) >= 2:
+                    headers = [c.strip() for c in data_rows[0].strip("|").split("|")]
+                    list_parts: list[str] = []
+                    for row in data_rows[1:]:
+                        cells = [c.strip() for c in row.strip("|").split("|")]
+                        lines = []
+                        for h, c in zip(headers, cells):
+                            lines.append(f"  {_html.escape(h)}: {_html.escape(c)}")
+                        list_parts.append("\n".join(lines))
+                    parts.append("\n\n".join(list_parts))
+                else:
+                    parts.append(f"<pre>{_html.escape(tseg.strip())}</pre>")
                 continue
-            # Escape then apply bold / italic.
-            escaped = _html.escape(part)
-            escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped, flags=re.DOTALL)
-            escaped = re.sub(r"\*(.+?)\*", r"<i>\1</i>", escaped, flags=re.DOTALL)
-            parts.append(escaped)
+
+            # Split on inline code spans.
+            inline_segments = re.split(r"(`[^`]+`)", tseg)
+            for part in inline_segments:
+                if part.startswith("`") and part.endswith("`") and len(part) > 1:
+                    parts.append(f"<code>{_html.escape(part[1:-1])}</code>")
+                    continue
+                # Escape then apply bold / italic.
+                escaped = _html.escape(part)
+                escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped, flags=re.DOTALL)
+                escaped = re.sub(r"\*(.+?)\*", r"<i>\1</i>", escaped, flags=re.DOTALL)
+                parts.append(escaped)
 
     return "".join(parts)
 

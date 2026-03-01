@@ -1,58 +1,68 @@
 """Configuration management for Chatter.
 
-Two config files:
-  ~/.chatter/config.yaml   — global, stores allowed_user_id (written once)
-  .chatter.yaml            — per-repo, stores bot_token and repo_name (gitignored)
+Single config file at ~/.chatter/config.yaml stores everything:
+  allowed_user_id  — Telegram user ID
+  repos            — map of repo name → {bot_token, path}
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
 GLOBAL_CONFIG_DIR = Path.home() / ".chatter"
 GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / "config.yaml"
-REPO_CONFIG_NAME = ".chatter.yaml"
 
 
 @dataclass
-class GlobalConfig:
+class RepoEntry:
+    bot_token: str
+    path: str
+
+
+@dataclass
+class ChatterConfig:
     allowed_user_id: int
+    repos: dict[str, RepoEntry] = field(default_factory=dict)
 
     @classmethod
-    def load(cls) -> "GlobalConfig":
+    def load(cls) -> "ChatterConfig":
         try:
             data = yaml.safe_load(GLOBAL_CONFIG_FILE.read_text())
         except FileNotFoundError:
             raise FileNotFoundError(
-                f"Global config not found at {GLOBAL_CONFIG_FILE}. Run `chatter init` first."
+                f"Config not found at {GLOBAL_CONFIG_FILE}. Run `chatter init` first."
             )
-        return cls(allowed_user_id=int(data["allowed_user_id"]))
+        repos = {}
+        for name, entry in (data.get("repos") or {}).items():
+            repos[name] = RepoEntry(bot_token=entry["bot_token"], path=entry["path"])
+        return cls(
+            allowed_user_id=int(data["allowed_user_id"]),
+            repos=repos,
+        )
 
-    @classmethod
-    def save(cls, allowed_user_id: int) -> None:
+    def save(self) -> None:
         GLOBAL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        GLOBAL_CONFIG_FILE.write_text(yaml.dump({"allowed_user_id": allowed_user_id}))
+        data = {
+            "allowed_user_id": self.allowed_user_id,
+            "repos": {
+                name: {"bot_token": entry.bot_token, "path": entry.path}
+                for name, entry in self.repos.items()
+            },
+        }
+        GLOBAL_CONFIG_FILE.write_text(yaml.dump(data, default_flow_style=False))
 
+    def find_repo_by_cwd(self) -> tuple[str, RepoEntry]:
+        cwd = str(Path.cwd().resolve())
+        for name, entry in self.repos.items():
+            if str(Path(entry.path).resolve()) == cwd:
+                return name, entry
+        raise LookupError(
+            f"No repo registered for {cwd}. Run `chatter init` in this directory first."
+        )
 
-@dataclass
-class RepoConfig:
-    bot_token: str
-    repo_name: str
-
-    @classmethod
-    def load(cls, path: Path | None = None) -> "RepoConfig":
-        config_path = path or (Path.cwd() / REPO_CONFIG_NAME)
-        try:
-            data = yaml.safe_load(config_path.read_text())
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"No {REPO_CONFIG_NAME} found in {config_path.parent}. Run `chatter init` first."
-            )
-        return cls(bot_token=data["bot_token"], repo_name=data.get("repo_name", config_path.parent.name))
-
-    @classmethod
-    def save(cls, path: Path, bot_token: str, repo_name: str) -> None:
-        path.write_text(yaml.dump({"bot_token": bot_token, "repo_name": repo_name}))
+    def add_repo(self, name: str, bot_token: str, path: str) -> None:
+        self.repos[name] = RepoEntry(bot_token=bot_token, path=str(Path(path).resolve()))
+        self.save()
