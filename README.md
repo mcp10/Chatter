@@ -5,9 +5,7 @@ Telegram bot that bridges messages to the local Claude CLI agent.
 ## Setup
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+python3 -m pip install -e .
 ```
 
 ## Commands
@@ -37,13 +35,13 @@ chatter notify "message"
 2. **Install Chatter** (once):
 
    ```bash
-   pip install -e /path/to/Chatter
+   python3 -m pip install -e <chatter-repo>
    ```
 
 3. **Run `chatter init`** inside the new project directory:
 
    ```bash
-   cd /path/to/your-project
+   cd <your-project>
    chatter init
    ```
 
@@ -66,8 +64,6 @@ chatter notify "message"
    chatter start
    ```
 
-## Run without activating venv
+## Notes
 
-```bash
-.venv/bin/chatter start
-```
+- Keep `.chatter.yaml` and any token files out of version control.
