@@ -24,9 +24,10 @@ chatter notify "message"
 ## Config files
 
 | File | Location | Contents |
-|------|----------|----------|
+| ---- | -------- | -------- |
 | Global | `~/.chatter/config.yaml` | `allowed_user_id` |
 | Per-repo | `.chatter.yaml` (gitignored) | `bot_token`, `repo_name` |
+| Local env (optional runtime mirror) | `.env` (gitignored) | `BOT_TOKEN`, `ALLOWED_USER_ID`, `REPO_NAME` |
 
 ## Adding Chatter to a new project
 
@@ -45,7 +46,7 @@ chatter notify "message"
    chatter init
    ```
 
-   This will ask for your Telegram user ID (first time only) and the bot token, then create `.chatter.yaml` and add it to `.gitignore`.
+   This will ask for your Telegram user ID (first time only) and the bot token, then create `.chatter.yaml`, update `.env`, and ensure both are in `.gitignore`.
 
 4. **Add the startup hook to `CLAUDE.md`** in the new project:
 
