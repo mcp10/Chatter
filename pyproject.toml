@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chatter"
+version = "0.1.0"
+description = "Telegram bot that bridges messages to a local Claude CLI agent"
+requires-python = ">=3.8"
+dependencies = [
+    "python-telegram-bot>=20.0",
+    "click>=8.1",
+    "pyyaml>=5.1",
+]
+
+[project.scripts]
+chatter = "chatter.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["chatter*"]

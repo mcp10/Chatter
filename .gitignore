@@ -1,0 +1,9 @@
+.env
+.env.*
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.chatter.yaml
+.claude/
+.DS_Store
