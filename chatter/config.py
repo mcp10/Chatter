@@ -7,6 +7,7 @@ Single config file at ~/.chatter/config.yaml stores everything:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,9 +56,9 @@ class ChatterConfig:
         GLOBAL_CONFIG_FILE.write_text(yaml.dump(data, default_flow_style=False))
 
     def find_repo_by_cwd(self) -> tuple[str, RepoEntry]:
-        cwd = str(Path.cwd().resolve())
+        cwd = os.path.normcase(str(Path.cwd().resolve()))
         for name, entry in self.repos.items():
-            if str(Path(entry.path).resolve()) == cwd:
+            if os.path.normcase(str(Path(entry.path).resolve())) == cwd:
                 return name, entry
         raise LookupError(
             f"No repo registered for {cwd}. Run `chatter init` in this directory first."

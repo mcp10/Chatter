@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import click
@@ -52,9 +53,10 @@ def init() -> None:
 
     # --- Check if cwd is already registered ---
     cwd = str(Path.cwd().resolve())
+    cwd_norm = os.path.normcase(cwd)
     existing_name = None
     for name, entry in cfg.repos.items():
-        if str(Path(entry.path).resolve()) == cwd:
+        if os.path.normcase(str(Path(entry.path).resolve())) == cwd_norm:
             existing_name = name
             break
 
@@ -71,7 +73,7 @@ def init() -> None:
     repo_name = click.prompt("Repo name", default=default_name)
 
     # Warn if a different repo already uses this name
-    if repo_name in cfg.repos and str(Path(cfg.repos[repo_name].path).resolve()) != cwd:
+    if repo_name in cfg.repos and os.path.normcase(str(Path(cfg.repos[repo_name].path).resolve())) != cwd_norm:
         click.confirm(
             f"A repo named '{repo_name}' is already registered at "
             f"{cfg.repos[repo_name].path}. Replace it?",

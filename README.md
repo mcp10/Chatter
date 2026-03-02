@@ -4,13 +4,19 @@ Telegram bot that bridges messages to the local Claude CLI agent.
 
 ## Install
 
-Quick install:
+**macOS / Linux:**
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/mcp10/Chatter/main/install.sh | bash
 ```
 
-Or manually:
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/mcp10/Chatter/main/install.ps1 | iex
+```
+
+**Or manually (any platform):**
 
 ```bash
 git clone https://github.com/mcp10/Chatter.git
@@ -55,7 +61,11 @@ No secrets are ever stored inside a repo directory.
 2. **Install Chatter** (once):
 
    ```bash
+   # macOS/Linux
    curl -sSL https://raw.githubusercontent.com/mcp10/Chatter/main/install.sh | bash
+
+   # Windows (PowerShell)
+   irm https://raw.githubusercontent.com/mcp10/Chatter/main/install.ps1 | iex
    ```
 
 3. **Run `chatter init`** inside the new project directory:

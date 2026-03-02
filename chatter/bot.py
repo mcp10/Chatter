@@ -55,6 +55,10 @@ _config: BotConfig | None = None
 # Terminal logging helpers
 # ---------------------------------------------------------------------------
 
+# Enable ANSI colors on Windows (no-op on Unix/macOS and modern Windows Terminal)
+import colorama
+colorama.just_fix_windows_console()
+
 _RESET  = "\033[0m"
 _BOLD   = "\033[1m"
 _DIM    = "\033[2m"
