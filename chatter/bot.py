@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html as _html
 import re
 import uuid
@@ -31,7 +32,6 @@ from claude_agent_sdk import (
     query,
 )
 from claude_agent_sdk.types import (
-    HookMatcher,
     PermissionResultAllow,
     PermissionResultDeny,
     StreamEvent,
@@ -83,7 +83,7 @@ def log_startup(user_id: int, repo: str) -> None:
 
 EDIT_INTERVAL = 2.0       # seconds between live message edits
 MAX_MSG_LEN = 3500        # headroom for HTML escaping overhead (Telegram limit is 4096)
-APPROVAL_TIMEOUT = 120    # seconds to wait for user approval before auto-deny
+APPROVAL_TIMEOUT = 600    # seconds to wait for user approval before auto-deny (10 min)
 
 # Tools that are auto-approved (read-only / non-destructive)
 SAFE_TOOLS: set[str] = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite"}
@@ -266,10 +266,21 @@ def _make_can_use_tool(chat_id: int, bot):
     async def can_use_tool(
         tool_name: str, input_data: dict[str, Any], context: Any
     ) -> PermissionResultAllow | PermissionResultDeny:
+        # Entire body wrapped so exceptions never leak into the SDK TaskGroup
+        try:
+            return await _can_use_tool_inner(tool_name, input_data)
+        except BaseException as e:
+            log_info(f"{_RED}can_use_tool crashed:{_RESET} {type(e).__name__}: {e}")
+            return PermissionResultDeny(message=f"Internal error: {e}")
+
+    async def _can_use_tool_inner(
+        tool_name: str, input_data: dict[str, Any]
+    ) -> PermissionResultAllow | PermissionResultDeny:
         s = get_state(chat_id)
 
         # Auto-approve safe tools
         if tool_name in SAFE_TOOLS:
+            log_info(f"{_GREEN}Auto-approved:{_RESET} {tool_name}")
             return PermissionResultAllow(updated_input=input_data)
 
         # Request approval via Telegram inline keyboard
@@ -285,36 +296,49 @@ def _make_can_use_tool(chat_id: int, bot):
             ]
         ])
 
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-        )
-        log_info(f"Approval requested: {tool_name} [{approval_id}]")
-
         try:
-            approved = await asyncio.wait_for(future, timeout=APPROVAL_TIMEOUT)
-        except asyncio.TimeoutError:
-            approved = False
-            log_info(f"Approval timed out: {approval_id}")
-            await bot.send_message(chat_id=chat_id, text="Timed out — auto-denied.")
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            log_info(f"{_RED}Failed to send approval message:{_RESET} {e}")
+            s["pending_approvals"].pop(approval_id, None)
+            return PermissionResultDeny(message=f"Could not send approval request: {e}")
+
+        log_info(f"{_YELLOW}Approval requested:{_RESET} {tool_name} [{approval_id}]")
+
+        # Wait for the user to tap Approve / Deny.
+        # Use a plain loop + short sleeps instead of asyncio.wait_for to avoid
+        # creating internal asyncio Tasks that conflict with anyio's TaskGroup.
+        deadline = asyncio.get_running_loop().time() + APPROVAL_TIMEOUT
+        try:
+            while not future.done():
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    log_info(f"Approval timed out: {approval_id}")
+                    try:
+                        await bot.send_message(chat_id=chat_id, text="Timed out — auto-denied.")
+                    except Exception:
+                        pass
+                    return PermissionResultDeny(message="Approval timed out")
+                await asyncio.sleep(min(0.25, remaining))
+
+            approved = future.result()
         finally:
             s["pending_approvals"].pop(approval_id, None)
 
         if approved:
-            log_info(f"Approved: {tool_name} [{approval_id}]")
+            log_info(f"{_GREEN}Approved:{_RESET} {tool_name} [{approval_id}]")
             return PermissionResultAllow(updated_input=input_data)
         else:
-            log_info(f"Denied: {tool_name} [{approval_id}]")
+            log_info(f"{_RED}Denied:{_RESET} {tool_name} [{approval_id}]")
             return PermissionResultDeny(message=f"User denied {tool_name}")
 
     return can_use_tool
 
-
-# Dummy hook required by the SDK to keep the stream open for can_use_tool
-async def _dummy_pre_tool_hook(input_data, tool_use_id, context):
-    return {"continue_": True}
 
 
 # ---------------------------------------------------------------------------
@@ -434,15 +458,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cwd=cwd,
         can_use_tool=_make_can_use_tool(chat_id, context.bot),
         include_partial_messages=True,
-        hooks={
-            "PreToolUse": [HookMatcher(matcher=None, hooks=[_dummy_pre_tool_hook])],
-        },
+        setting_sources=["user", "project", "local"],
     )
 
     if s.get("session_id"):
         options.resume = s["session_id"]
+        log_info(f"Resuming session {_BOLD}{s['session_id']}{_RESET}")
     elif s.get("session_started"):
         options.continue_conversation = True
+        log_info("Continuing conversation")
+    else:
+        log_info("Starting new session")
+
+    # can_use_tool requires streaming mode — wrap the prompt in an async generator.
+    # The SDK (patched) waits for the first result before closing stdin when
+    # can_use_tool is set, so the generator can exhaust normally.
+    async def _prompt_stream():
+        yield {
+            "type": "user",
+            "message": {"role": "user", "content": prompt},
+            "parent_tool_use_id": None,
+            "session_id": s.get("session_id") or "default",
+        }
 
     streaming_text = ""   # accumulated from StreamEvents (real-time)
     final_output = ""     # accumulated from AssistantMessages (authoritative)
@@ -450,7 +487,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     last_edit = asyncio.get_running_loop().time()
 
     try:
-        async for message in query(prompt=prompt, options=options):
+        async for message in query(prompt=_prompt_stream(), options=options):
             # Check for cancellation
             if s.get("cancelled"):
                 break
@@ -458,24 +495,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if isinstance(message, StreamEvent):
                 # Real-time text deltas for live preview
                 event = message.event
-                if event.get("type") == "content_block_delta":
+                etype = event.get("type", "")
+                if etype == "content_block_delta":
                     delta = event.get("delta", {})
                     if delta.get("type") == "text_delta":
                         streaming_text += delta.get("text", "")
+                elif etype == "content_block_start":
+                    block = event.get("content_block", {})
+                    btype = block.get("type", "")
+                    if btype == "tool_use":
+                        log_info(f"{_BLUE}Tool call:{_RESET} {block.get('name', '?')}")
 
             elif isinstance(message, AssistantMessage):
                 # Authoritative full text — replaces streaming accumulator
+                text_len = 0
                 for block in message.content:
                     if hasattr(block, "text"):
                         final_output += block.text
+                        text_len += len(block.text)
                 streaming_text = ""
+                log_info(f"{_YELLOW}AssistantMessage:{_RESET} {text_len} chars")
 
             elif isinstance(message, ResultMessage):
                 s["session_id"] = message.session_id or s.get("session_id")
                 result_text = message.result or ""
                 s["session_started"] = True
+                log_info(f"{_GREEN}ResultMessage:{_RESET} session={s['session_id']}  result={len(result_text)} chars")
 
             elif isinstance(message, SystemMessage):
+                log_info(f"{_DIM}SystemMessage:{_RESET} subtype={message.subtype}")
                 if message.subtype == "init" and hasattr(message, "data"):
                     sid = (message.data or {}).get("session_id")
                     if sid:
@@ -490,7 +538,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 last_edit = now
 
     except Exception as e:
-        log_info(f"SDK error: {e}")
+        log_info(f"{_RED}SDK error:{_RESET} {e}")
         if not final_output:
             final_output = f"Error: {e}"
     finally:
@@ -512,7 +560,12 @@ def run_bot(config: BotConfig) -> None:
     global _config
     _config = config
 
-    app = Application.builder().token(config.bot_token).build()
+    # The SDK closes stdin after this timeout (ms) if it hasn't received a result.
+    # Default 60 s is too short when waiting for human approval on Telegram.
+    import os
+    os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", str(APPROVAL_TIMEOUT * 1000 + 60_000))
+
+    app = Application.builder().token(config.bot_token).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
