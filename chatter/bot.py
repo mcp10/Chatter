@@ -279,7 +279,8 @@ def _make_can_use_tool(chat_id: int, bot):
     async def can_use_tool(
         tool_name: str, input_data: dict[str, Any], context: Any
     ) -> PermissionResultAllow | PermissionResultDeny:
-        # Entire body wrapped so exceptions never leak into the SDK TaskGroup
+        # Entire body wrapped so exceptions never leak into the SDK TaskGroup,
+        # but allow task cancellation to propagate correctly.
         try:
             return await _can_use_tool_inner(tool_name, input_data)
         except Exception as e:
@@ -436,7 +437,13 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_allowed(update):
         return
     s = get_state(update.effective_chat.id)
-    if _cancel_run(s, reason="Cancelled by user."):
+    if s.get("running"):
+        s["cancelled"] = True
+        # Deny all pending approvals so the SDK unblocks
+        for future in list(s["pending_approvals"].values()):
+            if not future.done():
+                future.set_result(False)
+        s["pending_approvals"].clear()
         await update.message.reply_text("Cancelling…")
     else:
         await update.message.reply_text("No agent running.")
@@ -463,9 +470,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     s = get_state(chat_id)
     lock: asyncio.Lock = s["lock"]
 
-    # Keep at most one active run per chat: interrupt the previous one if needed.
-    if lock.locked():
-        _cancel_run(s, reason="Interrupted by a newer prompt.")
+    # If agent is running, deny pending approvals so it unblocks, then wait briefly
+    if s.get("running"):
+        s["cancelled"] = True
+        pending_futures = list(s["pending_approvals"].values())
+        for future in pending_futures:
+            if not future.done():
+                future.set_result(False)
+        s["pending_approvals"].clear()
+        await asyncio.sleep(0.5)
+
+    prompt = update.message.text
+    cwd = s["cwd"]
+    log_user(update.effective_user.id, prompt)
+
+    s["running"] = True
+    s["cancelled"] = False
+    start_time = asyncio.get_running_loop().time()
+    status_msg = await update.message.reply_text("⏳ Thinking… (0s)")
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(
+        _typing_loop(chat_id, context.bot, stop_typing)
+    )
 
     async with lock:
         prompt = update.message.text
@@ -584,12 +610,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             with suppress(asyncio.CancelledError):
                 await typing_task
 
-            if s.get("run_task") is asyncio.current_task():
-                s["run_task"] = None
-            s["running"] = False
-            s["cancelled"] = False
-            s["cancel_reason"] = None
-            log_info(f"Done. session={s.get('session_id')}  out={len(final_output)}  result={len(result_text)}")
+    try:
+        async for message in query(prompt=_prompt_stream(), options=options):
+            # Check for cancellation
+            if s.get("cancelled"):
+                break
+
+            if isinstance(message, StreamEvent):
+                # Real-time text deltas for live preview
+                event = message.event
+                etype = event.get("type", "")
+                if etype == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        streaming_text += delta.get("text", "")
+                elif etype == "content_block_start":
+                    block = event.get("content_block", {})
+                    btype = block.get("type", "")
+                    if btype == "tool_use":
+                        log_info(f"{_BLUE}Tool call:{_RESET} {block.get('name', '?')}")
+
+            elif isinstance(message, AssistantMessage):
+                # Authoritative full text — replaces streaming accumulator
+                text_len = 0
+                new_output = ""
+                for block in message.content:
+                    if hasattr(block, "text"):
+                        new_output += block.text
+                        text_len += len(block.text)
+                final_output = new_output
+                streaming_text = ""
+                log_info(f"{_YELLOW}AssistantMessage:{_RESET} {text_len} chars")
+
+            elif isinstance(message, ResultMessage):
+                s["session_id"] = message.session_id or s.get("session_id")
+                result_text = message.result or ""
+                s["session_started"] = True
+                log_info(f"{_GREEN}ResultMessage:{_RESET} session={s['session_id']}  result={len(result_text)} chars")
+
+            elif isinstance(message, SystemMessage):
+                log_info(f"{_DIM}SystemMessage:{_RESET} subtype={message.subtype}")
+                if message.subtype == "init" and hasattr(message, "data"):
+                    sid = (message.data or {}).get("session_id")
+                    if sid:
+                        s["session_id"] = sid
+
+            # Live-edit the status message
+            now = asyncio.get_running_loop().time()
+            if now - last_edit >= EDIT_INTERVAL:
+                elapsed = int(now - start_time)
+                display = (final_output + streaming_text) or f"⏳ Thinking… ({elapsed}s)"
+                await safe_edit(status_msg, display)
+                last_edit = now
+
+    except Exception as e:
+        log_info(f"{_RED}SDK error:{_RESET} {e}")
+        if not final_output:
+            final_output = f"Error: {e}"
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+        s["running"] = False
+        s["cancelled"] = False
+        log_info(f"Done. session={s.get('session_id')}  out={len(final_output)}  result={len(result_text)}")
 
         output = final_output or result_text
         if cancelled and not output:
