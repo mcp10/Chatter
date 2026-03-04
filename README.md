@@ -22,7 +22,7 @@ irm https://raw.githubusercontent.com/mcp10/Chatter/main/install.ps1 | iex
 
 ```bash
 git clone https://github.com/mcp10/Chatter.git
-python3.12 -m pip install --upgrade --force-reinstall ./Chatter
+python -m pip install --upgrade --force-reinstall ./Chatter
 ```
 
 ## Commands
