@@ -5,20 +5,35 @@ from __future__ import annotations
 
 import asyncio
 import html as _html
-import json
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
+)
+
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ResultMessage,
+    SystemMessage,
+    query,
+)
+from claude_agent_sdk.types import (
+    PermissionResultAllow,
+    PermissionResultDeny,
+    StreamEvent,
 )
 
 # ---------------------------------------------------------------------------
@@ -61,30 +76,16 @@ def log_user(user_id: int, text: str) -> None:
     print(f"{_DIM}{_ts()}{_RESET}  {_CYAN}{_BOLD}[user {user_id}]{_RESET} {text}")
 
 
-def log_stdout(line: str) -> None:
-    print(f"{_DIM}{_ts()}{_RESET}  {_DIM}[stdout]{_RESET} {line}")
-
-
-def log_stderr(text: str) -> None:
-    for line in text.splitlines():
-        print(f"{_DIM}{_ts()}{_RESET}  {_YELLOW}[stderr]{_RESET} {line}")
-
-
-def log_exit(code: int, session_id: str | None, out_len: int, res_len: int) -> None:
-    color = _GREEN if code == 0 else _RED
-    print(
-        f"{_DIM}{_ts()}{_RESET}  {color}{_BOLD}[exit {code}]{_RESET}"
-        f"  session={session_id}  out={out_len}  result={res_len}"
-    )
-
-
 def log_startup(user_id: int, repo: str) -> None:
     print(f"\n{_GREEN}{_BOLD}Bot started.{_RESET}  user={_BOLD}{user_id}{_RESET}  repo={repo}\n")
 
 
 EDIT_INTERVAL = 2.0       # seconds between live message edits
 MAX_MSG_LEN = 3500        # headroom for HTML escaping overhead (Telegram limit is 4096)
-SUBPROCESS_TIMEOUT = 300  # seconds of silence before killing a hung claude process
+APPROVAL_TIMEOUT = 600    # seconds to wait for user approval before auto-deny (10 min)
+
+# Tools that are auto-approved (read-only / non-destructive)
+SAFE_TOOLS: set[str] = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite"}
 
 
 # ---------------------------------------------------------------------------
@@ -98,9 +99,11 @@ def get_state(chat_id: int) -> dict:
     if chat_id not in _state:
         _state[chat_id] = {
             "cwd": _config.repo_path,
-            "proc": None,
+            "running": False,
             "session_id": None,
             "session_started": False,
+            "cancelled": False,
+            "pending_approvals": {},   # approval_id -> asyncio.Future
         }
     return _state[chat_id]
 
@@ -224,6 +227,161 @@ async def send_final(status_msg, reply_to, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tool approval helpers
+# ---------------------------------------------------------------------------
+
+def _format_tool_request(tool_name: str, input_data: dict[str, Any]) -> str:
+    """Format a tool approval request for Telegram display."""
+    parts = [f"<b>Tool: {_html.escape(tool_name)}</b>\n"]
+
+    if tool_name == "Bash":
+        cmd = input_data.get("command", "")
+        desc = input_data.get("description", "")
+        if desc:
+            parts.append(f"{_html.escape(desc)}\n")
+        parts.append(f"<pre>{_html.escape(trim(cmd))}</pre>")
+
+    elif tool_name in ("Write", "Edit"):
+        fp = input_data.get("file_path", "")
+        parts.append(f"File: <code>{_html.escape(fp)}</code>\n")
+        if tool_name == "Edit":
+            old = input_data.get("old_string", "")[:300]
+            new = input_data.get("new_string", "")[:300]
+            parts.append(f"<pre>- {_html.escape(old)}\n+ {_html.escape(new)}</pre>")
+        else:
+            content = input_data.get("content", "")[:500]
+            parts.append(f"<pre>{_html.escape(content)}</pre>")
+
+    else:
+        summary = str(input_data)[:500]
+        parts.append(f"<pre>{_html.escape(summary)}</pre>")
+
+    return "\n".join(parts)
+
+
+def _make_can_use_tool(chat_id: int, bot):
+    """Factory that creates a can_use_tool callback bound to a specific chat."""
+
+    async def can_use_tool(
+        tool_name: str, input_data: dict[str, Any], context: Any
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        # Entire body wrapped so exceptions never leak into the SDK TaskGroup,
+        # but allow task cancellation to propagate correctly.
+        try:
+            return await _can_use_tool_inner(tool_name, input_data)
+        except asyncio.CancelledError:
+            # Preserve cancellation semantics for the surrounding TaskGroup / event loop.
+            raise
+        except Exception as e:
+            log_info(f"{_RED}can_use_tool crashed:{_RESET} {type(e).__name__}: {e}")
+            return PermissionResultDeny(message=f"Internal error: {e}")
+
+    async def _can_use_tool_inner(
+        tool_name: str, input_data: dict[str, Any]
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        s = get_state(chat_id)
+
+        # Auto-approve safe tools
+        if tool_name in SAFE_TOOLS:
+            log_info(f"{_GREEN}Auto-approved:{_RESET} {tool_name}")
+            return PermissionResultAllow(updated_input=input_data)
+
+        # Request approval via Telegram inline keyboard
+        approval_id = uuid.uuid4().hex[:8]
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        s["pending_approvals"][approval_id] = future
+
+        text = _format_tool_request(tool_name, input_data)
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Approve", callback_data=f"ap:{approval_id}"),
+                InlineKeyboardButton("Deny", callback_data=f"dn:{approval_id}"),
+            ]
+        ])
+
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            log_info(f"{_RED}Failed to send approval message:{_RESET} {e}")
+            s["pending_approvals"].pop(approval_id, None)
+            return PermissionResultDeny(message=f"Could not send approval request: {e}")
+
+        log_info(f"{_YELLOW}Approval requested:{_RESET} {tool_name} [{approval_id}]")
+
+        # Wait for the user to tap Approve / Deny.
+        # Use a plain loop + short sleeps instead of asyncio.wait_for to avoid
+        # creating internal asyncio Tasks that conflict with anyio's TaskGroup.
+        deadline = asyncio.get_running_loop().time() + APPROVAL_TIMEOUT
+        try:
+            while not future.done():
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    log_info(f"Approval timed out: {approval_id}")
+                    try:
+                        await bot.send_message(chat_id=chat_id, text="Timed out — auto-denied.")
+                    except Exception:
+                        pass
+                    return PermissionResultDeny(message="Approval timed out")
+                await asyncio.sleep(min(0.25, remaining))
+
+            approved = future.result()
+        finally:
+            s["pending_approvals"].pop(approval_id, None)
+
+        if approved:
+            log_info(f"{_GREEN}Approved:{_RESET} {tool_name} [{approval_id}]")
+            return PermissionResultAllow(updated_input=input_data)
+        else:
+            log_info(f"{_RED}Denied:{_RESET} {tool_name} [{approval_id}]")
+            return PermissionResultDeny(message=f"User denied {tool_name}")
+
+    return can_use_tool
+
+
+
+# ---------------------------------------------------------------------------
+# Callback handler for inline keyboard approval buttons
+# ---------------------------------------------------------------------------
+
+async def _approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard button presses for tool approval."""
+    cb = update.callback_query
+    await cb.answer()
+
+    if not is_allowed(update):
+        return
+
+    data = cb.data or ""
+    chat_id = update.effective_chat.id
+    s = get_state(chat_id)
+
+    if data.startswith("ap:") or data.startswith("dn:"):
+        prefix, approval_id = data.split(":", 1)
+        approved = prefix == "ap"
+        future = s["pending_approvals"].get(approval_id)
+        if future and not future.done():
+            future.set_result(approved)
+            label = "APPROVED" if approved else "DENIED"
+            try:
+                await cb.edit_message_text(
+                    f"{cb.message.text_html}\n\n<b>{label}</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except BadRequest:
+                pass
+        else:
+            try:
+                await cb.edit_message_text("(expired)")
+            except BadRequest:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 
@@ -244,11 +402,14 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_allowed(update):
         return
     s = get_state(update.effective_chat.id)
-    proc = s.get("proc")
-    if proc and proc.returncode is None:
-        proc.terminate()
-        s["proc"] = None
-        await update.message.reply_text("Agent stopped.")
+    if s.get("running"):
+        s["cancelled"] = True
+        # Deny all pending approvals so the SDK unblocks
+        for future in list(s["pending_approvals"].values()):
+            if not future.done():
+                future.set_result(False)
+        s["pending_approvals"].clear()
+        await update.message.reply_text("Cancelling…")
     else:
         await update.message.reply_text("No agent running.")
 
@@ -263,7 +424,7 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main message handler — runs Claude and streams output
+# Main message handler — runs Claude via SDK and streams output
 # ---------------------------------------------------------------------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -271,101 +432,129 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     s = get_state(update.effective_chat.id)
+    chat_id = update.effective_chat.id
 
-    # Kill any existing process before starting a new one
-    if s.get("proc") and s["proc"].returncode is None:
-        s["proc"].terminate()
-        await asyncio.sleep(0.2)
+    # If agent is running, deny pending approvals so it unblocks, then wait briefly
+    if s.get("running"):
+        s["cancelled"] = True
+        pending_futures = list(s["pending_approvals"].values())
+        for future in pending_futures:
+            if not future.done():
+                future.set_result(False)
+        s["pending_approvals"].clear()
+        await asyncio.sleep(0.5)
 
     prompt = update.message.text
     cwd = s["cwd"]
     log_user(update.effective_user.id, prompt)
 
+    s["running"] = True
+    s["cancelled"] = False
     start_time = asyncio.get_running_loop().time()
     status_msg = await update.message.reply_text("⏳ Thinking… (0s)")
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(
-        _typing_loop(update.effective_chat.id, context.bot, stop_typing)
+        _typing_loop(chat_id, context.bot, stop_typing)
     )
 
-    cmd = ["claude", "--print", "--verbose", "--output-format", "stream-json", "--dangerously-skip-permissions"]
-    if s.get("session_id"):
-        cmd += ["--resume", s["session_id"]]
-    elif s.get("session_started"):
-        cmd.append("--continue")
-    cmd.append(prompt)
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    # Build SDK options
+    options = ClaudeAgentOptions(
         cwd=cwd,
-        limit=10 * 1024 * 1024,  # 10 MB — default 64 KB is too small for Claude's JSON lines
+        can_use_tool=_make_can_use_tool(chat_id, context.bot),
+        include_partial_messages=True,
+        setting_sources=["user", "project", "local"],
     )
-    s["proc"] = proc
 
-    output = ""
+    if s.get("session_id"):
+        options.resume = s["session_id"]
+        log_info(f"Resuming session {_BOLD}{s['session_id']}{_RESET}")
+    elif s.get("session_started"):
+        options.continue_conversation = True
+        log_info("Continuing conversation")
+    else:
+        log_info("Starting new session")
+
+    # can_use_tool requires streaming mode — wrap the prompt in an async generator.
+    # The SDK (patched) waits for the first result before closing stdin when
+    # can_use_tool is set, so the generator can exhaust normally.
+    async def _prompt_stream():
+        yield {
+            "type": "user",
+            "message": {"role": "user", "content": prompt},
+            "parent_tool_use_id": None,
+            "session_id": s.get("session_id") or "default",
+        }
+
+    streaming_text = ""   # accumulated from StreamEvents (real-time)
+    final_output = ""     # accumulated from AssistantMessages (authoritative)
     result_text = ""
     last_edit = asyncio.get_running_loop().time()
-    timed_out = False
 
-    while True:
-        try:
-            raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=SUBPROCESS_TIMEOUT)
-        except asyncio.TimeoutError:
-            log_info(f"Claude produced no output for {SUBPROCESS_TIMEOUT}s — terminating.")
-            proc.terminate()
-            timed_out = True
-            break
-        if not raw_line:  # EOF
-            break
+    try:
+        async for message in query(prompt=_prompt_stream(), options=options):
+            # Check for cancellation
+            if s.get("cancelled"):
+                break
 
-        line = raw_line.decode(errors="replace").strip()
-        log_stdout(line)
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            output += line + "\n"
-        else:
-            event_type = event.get("type")
-            if event_type == "system" and event.get("subtype") == "init":
-                s["session_id"] = event.get("session_id") or s.get("session_id")
-            elif event_type == "assistant":
-                for block in event.get("message", {}).get("content", []):
-                    if block.get("type") == "text":
-                        output += block["text"]
-            elif event_type == "result":
-                s["session_id"] = event.get("session_id") or s.get("session_id")
-                result_text = event.get("result", "")
+            if isinstance(message, StreamEvent):
+                # Real-time text deltas for live preview
+                event = message.event
+                etype = event.get("type", "")
+                if etype == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        streaming_text += delta.get("text", "")
+                elif etype == "content_block_start":
+                    block = event.get("content_block", {})
+                    btype = block.get("type", "")
+                    if btype == "tool_use":
+                        log_info(f"{_BLUE}Tool call:{_RESET} {block.get('name', '?')}")
 
-        now = asyncio.get_running_loop().time()
-        if now - last_edit >= EDIT_INTERVAL:
-            elapsed = int(now - start_time)
-            display = output if output else f"⏳ Thinking… ({elapsed}s)"
-            await safe_edit(status_msg, display)
-            last_edit = now
+            elif isinstance(message, AssistantMessage):
+                # Authoritative full text — replaces streaming accumulator
+                text_len = 0
+                new_output = ""
+                for block in message.content:
+                    if hasattr(block, "text"):
+                        new_output += block.text
+                        text_len += len(block.text)
+                final_output = new_output
+                streaming_text = ""
+                log_info(f"{_YELLOW}AssistantMessage:{_RESET} {text_len} chars")
 
-    stderr_out = await proc.stderr.read()
-    if stderr_out:
-        log_stderr(stderr_out.decode(errors="replace"))
+            elif isinstance(message, ResultMessage):
+                s["session_id"] = message.session_id or s.get("session_id")
+                result_text = message.result or ""
+                s["session_started"] = True
+                log_info(f"{_GREEN}ResultMessage:{_RESET} session={s['session_id']}  result={len(result_text)} chars")
 
-    await proc.wait()
-    stop_typing.set()
-    typing_task.cancel()
-    s["proc"] = None
-    if proc.returncode == 0:
-        s["session_started"] = True
-    log_exit(proc.returncode, s.get("session_id"), len(output), len(result_text))
+            elif isinstance(message, SystemMessage):
+                log_info(f"{_DIM}SystemMessage:{_RESET} subtype={message.subtype}")
+                if message.subtype == "init" and hasattr(message, "data"):
+                    sid = (message.data or {}).get("session_id")
+                    if sid:
+                        s["session_id"] = sid
 
-    if timed_out:
-        await send_final(status_msg, update.message, output or f"⏱ No response after {SUBPROCESS_TIMEOUT}s.")
-        return
+            # Live-edit the status message
+            now = asyncio.get_running_loop().time()
+            if now - last_edit >= EDIT_INTERVAL:
+                elapsed = int(now - start_time)
+                display = (final_output + streaming_text) or f"⏳ Thinking… ({elapsed}s)"
+                await safe_edit(status_msg, display)
+                last_edit = now
 
-    if not output:
-        output = result_text
+    except Exception as e:
+        log_info(f"{_RED}SDK error:{_RESET} {e}")
+        if not final_output:
+            final_output = f"Error: {e}"
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+        s["running"] = False
+        s["cancelled"] = False
+        log_info(f"Done. session={s.get('session_id')}  out={len(final_output)}  result={len(result_text)}")
 
+    output = final_output or result_text
     await send_final(status_msg, update.message, output)
 
 
@@ -377,10 +566,16 @@ def run_bot(config: BotConfig) -> None:
     global _config
     _config = config
 
-    app = Application.builder().token(config.bot_token).build()
+    # The SDK closes stdin after this timeout (ms) if it hasn't received a result.
+    # Default 60 s is too short when waiting for human approval on Telegram.
+    import os
+    os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", str(APPROVAL_TIMEOUT * 1000 + 60_000))
+
+    app = Application.builder().token(config.bot_token).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
+    app.add_handler(CallbackQueryHandler(_approval_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     log_startup(config.allowed_user_id, config.repo_path)
