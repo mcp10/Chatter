@@ -401,7 +401,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if s.get("running"):
         s["cancelled"] = True
         # Deny all pending approvals so the SDK unblocks
-        for future in s["pending_approvals"].values():
+        for future in list(s["pending_approvals"].values()):
             if not future.done():
                 future.set_result(False)
         s["pending_approvals"].clear()
