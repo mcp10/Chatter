@@ -2,19 +2,27 @@
 
 Telegram bot that bridges messages to the local Claude CLI agent.
 
+Requires Python 3.10+.
+
 ## Install
 
-Quick install:
+**macOS / Linux:**
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/mcp10/Chatter/main/install.sh | bash
 ```
 
-Or manually:
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/mcp10/Chatter/main/install.ps1 | iex
+```
+
+**Or manually (any platform):**
 
 ```bash
 git clone https://github.com/mcp10/Chatter.git
-pip install ./Chatter
+python -m pip install --upgrade --force-reinstall ./Chatter
 ```
 
 ## Commands
@@ -55,7 +63,11 @@ No secrets are ever stored inside a repo directory.
 2. **Install Chatter** (once):
 
    ```bash
+   # macOS/Linux
    curl -sSL https://raw.githubusercontent.com/mcp10/Chatter/main/install.sh | bash
+
+   # Windows (PowerShell)
+   irm https://raw.githubusercontent.com/mcp10/Chatter/main/install.ps1 | iex
    ```
 
 3. **Run `chatter init`** inside the new project directory:
@@ -83,3 +95,22 @@ No secrets are ever stored inside a repo directory.
    ```bash
    chatter start
    ```
+
+## Troubleshooting
+
+### `ModuleNotFoundError: No module named 'claude_agent_sdk'`
+
+This means the `chatter` launcher is running under a Python environment that does not
+have Chatter's runtime dependencies installed.
+
+```bash
+which chatter
+head -n 1 "$(which chatter)"   # shows the Python interpreter used by chatter
+```
+
+Then install/reinstall into that same interpreter:
+
+```bash
+<python-from-shebang> -m pip install --upgrade "claude-agent-sdk>=0.1.44"
+<python-from-shebang> -m pip install --upgrade --force-reinstall "git+https://github.com/mcp10/Chatter.git"
+```
