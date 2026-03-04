@@ -3,13 +3,48 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import click
 
-from .bot import BotConfig, run_bot
 from .config import GLOBAL_CONFIG_FILE, ChatterConfig
 from .notify import send_startup_notification
+
+MIN_PYTHON = (3, 10)
+REPO_URL = "https://github.com/mcp10/Chatter.git"
+
+
+def _ensure_supported_python() -> None:
+    """Fail fast with a clear message when Python is too old."""
+    if sys.version_info >= MIN_PYTHON:
+        return
+    current = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    required = f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
+    raise click.ClickException(
+        f"Chatter requires Python {required}+ (current: {current}).\n"
+        f"Interpreter: {sys.executable}\n"
+        "Reinstall with a supported interpreter, for example:\n"
+        f'  python3.12 -m pip install --upgrade --force-reinstall "git+{REPO_URL}"'
+    )
+
+
+def _import_bot_runtime():
+    """Import bot runtime lazily so init/notify still work when bot deps are missing."""
+    try:
+        from .bot import BotConfig, run_bot
+    except ModuleNotFoundError as e:
+        if e.name and e.name.startswith("claude_agent_sdk"):
+            raise click.ClickException(
+                "Missing runtime dependency 'claude-agent-sdk' required by `chatter start`.\n"
+                f"Interpreter: {sys.executable}\n"
+                "Install it into this interpreter:\n"
+                f'  {sys.executable} -m pip install --upgrade "claude-agent-sdk>=0.1.44"\n'
+                "If this is an older Chatter install, reinstall Chatter as well:\n"
+                f'  {sys.executable} -m pip install --upgrade --force-reinstall "git+{REPO_URL}"'
+            ) from e
+        raise
+    return BotConfig, run_bot
 
 
 def _load_config() -> ChatterConfig:
@@ -34,6 +69,7 @@ def _load_repo_config() -> tuple[ChatterConfig, str, "RepoEntry"]:  # noqa: F821
 @click.pass_context
 def main(ctx: click.Context) -> None:
     """Chatter — Telegram bot bridging messages to a local Claude CLI agent."""
+    _ensure_supported_python()
     if ctx.invoked_subcommand is None:
         ctx.invoke(start)
 
@@ -93,10 +129,11 @@ def init() -> None:
 def start() -> None:
     """Start the bot for the current repository."""
     cfg, repo_name, repo = _load_repo_config()
+    BotConfig, run_bot = _import_bot_runtime()
     config = BotConfig(
         bot_token=repo.bot_token,
         allowed_user_id=cfg.allowed_user_id,
-        repo_path=str(Path.cwd()),
+        repo_path=str(Path(repo.path).resolve()),
         repo_name=repo_name,
     )
     run_bot(config)

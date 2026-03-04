@@ -11,13 +11,28 @@ if ! command -v python3 &>/dev/null; then
     exit 1
 fi
 
+if ! command -v git &>/dev/null; then
+    echo "Error: git is required but not found." >&2
+    exit 1
+fi
+
 if ! python3 -m pip --version &>/dev/null; then
     echo "Error: pip is required but not found." >&2
     exit 1
 fi
 
+if ! python3 - <<'PY'
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+then
+    PY_VER="$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
+    echo "Error: Chatter requires Python 3.10+ (found ${PY_VER})." >&2
+    exit 1
+fi
+
 # --- Install from GitHub ---
-python3 -m pip install "git+${REPO}" --quiet
+python3 -m pip install --upgrade --force-reinstall "git+${REPO}" --quiet
 
 # --- Verify ---
 if command -v chatter &>/dev/null; then

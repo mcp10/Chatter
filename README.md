@@ -2,6 +2,8 @@
 
 Telegram bot that bridges messages to the local Claude CLI agent.
 
+Requires Python 3.10+.
+
 ## Install
 
 **macOS / Linux:**
@@ -20,7 +22,7 @@ irm https://raw.githubusercontent.com/mcp10/Chatter/main/install.ps1 | iex
 
 ```bash
 git clone https://github.com/mcp10/Chatter.git
-pip install ./Chatter
+python3.12 -m pip install --upgrade --force-reinstall ./Chatter
 ```
 
 ## Commands
@@ -93,3 +95,22 @@ No secrets are ever stored inside a repo directory.
    ```bash
    chatter start
    ```
+
+## Troubleshooting
+
+### `ModuleNotFoundError: No module named 'claude_agent_sdk'`
+
+This means the `chatter` launcher is running under a Python environment that does not
+have Chatter's runtime dependencies installed.
+
+```bash
+which chatter
+head -n 1 "$(which chatter)"   # shows the Python interpreter used by chatter
+```
+
+Then install/reinstall into that same interpreter:
+
+```bash
+<python-from-shebang> -m pip install --upgrade "claude-agent-sdk>=0.1.44"
+<python-from-shebang> -m pip install --upgrade --force-reinstall "git+https://github.com/mcp10/Chatter.git"
+```
