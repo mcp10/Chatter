@@ -265,10 +265,14 @@ def _make_can_use_tool(chat_id: int, bot):
     async def can_use_tool(
         tool_name: str, input_data: dict[str, Any], context: Any
     ) -> PermissionResultAllow | PermissionResultDeny:
-        # Entire body wrapped so exceptions never leak into the SDK TaskGroup
+        # Entire body wrapped so exceptions never leak into the SDK TaskGroup,
+        # but allow task cancellation to propagate correctly.
         try:
             return await _can_use_tool_inner(tool_name, input_data)
-        except BaseException as e:
+        except asyncio.CancelledError:
+            # Preserve cancellation semantics for the surrounding TaskGroup / event loop.
+            raise
+        except Exception as e:
             log_info(f"{_RED}can_use_tool crashed:{_RESET} {type(e).__name__}: {e}")
             return PermissionResultDeny(message=f"Internal error: {e}")
 
