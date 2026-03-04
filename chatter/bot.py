@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import html as _html
 import re
 import uuid
