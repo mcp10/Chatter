@@ -25,7 +25,9 @@ def _ensure_supported_python() -> None:
         f"Chatter requires Python {required}+ (current: {current}).\n"
         f"Interpreter: {sys.executable}\n"
         "Reinstall with a supported interpreter, for example:\n"
-        f'  python3.12 -m pip install --upgrade --force-reinstall "git+{REPO_URL}"'
+        f'  python -m pip install --upgrade --force-reinstall "git+{REPO_URL}"\n'
+        "On Windows, you can use:\n"
+        f'  py -3.10 -m pip install --upgrade --force-reinstall "git+{REPO_URL}"'
     )
 
 
