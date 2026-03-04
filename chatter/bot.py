@@ -338,6 +338,9 @@ def _make_can_use_tool(chat_id: int, bot):
                         await bot.send_message(chat_id=chat_id, text="Timed out — auto-denied.")
                     except Exception:
                         pass
+                    # Complete the future to avoid leaving it pending on timeout.
+                    if not future.done():
+                        future.set_result(False)
                     return PermissionResultDeny(message="Approval timed out")
                 await asyncio.sleep(min(0.25, remaining))
 
