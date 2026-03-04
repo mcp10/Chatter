@@ -318,6 +318,8 @@ def _make_can_use_tool(chat_id: int, bot):
             )
         except Exception as e:
             log_info(f"{_RED}Failed to send approval message:{_RESET} {e}")
+            if not future.done():
+                future.cancel()
             s["pending_approvals"].pop(approval_id, None)
             return PermissionResultDeny(message=f"Could not send approval request: {e}")
 
