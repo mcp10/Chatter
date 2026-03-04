@@ -434,7 +434,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # If agent is running, deny pending approvals so it unblocks, then wait briefly
     if s.get("running"):
         s["cancelled"] = True
-        for future in s["pending_approvals"].values():
+        pending_futures = list(s["pending_approvals"].values())
+        for future in pending_futures:
             if not future.done():
                 future.set_result(False)
         s["pending_approvals"].clear()
