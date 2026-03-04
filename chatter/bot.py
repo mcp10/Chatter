@@ -99,6 +99,9 @@ SAFE_TOOLS: set[str] = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWr
 _CB_APPROVE = "ap"
 _CB_DENY    = "dn"
 
+# Cancel reason used when a newer prompt interrupts the current run
+_INTERRUPT_REASON = "Interrupted by a newer prompt."
+
 
 # ---------------------------------------------------------------------------
 # Per-chat state
@@ -470,7 +473,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Keep at most one active run per chat: interrupt the previous one if needed.
     if lock.locked():
-        _cancel_run(s, reason="Interrupted by a newer prompt.")
+        _cancel_run(s, reason=_INTERRUPT_REASON)
 
     async with lock:
         prompt = update.message.text
@@ -598,6 +601,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         output = final_output or result_text
         if cancelled and not output:
+            if cancel_reason == _INTERRUPT_REASON:
+                # Silently remove the Thinking indicator — the new query will
+                # send its own, so the user never sees two Thinking bubbles.
+                with suppress(Exception):
+                    await status_msg.delete()
+                return
             output = cancel_reason
         await send_final(status_msg, update.message, output)
 
