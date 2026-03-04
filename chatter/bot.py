@@ -510,10 +510,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             elif isinstance(message, AssistantMessage):
                 # Authoritative full text — replaces streaming accumulator
                 text_len = 0
+                new_output = ""
                 for block in message.content:
                     if hasattr(block, "text"):
-                        final_output += block.text
+                        new_output += block.text
                         text_len += len(block.text)
+                final_output = new_output
                 streaming_text = ""
                 log_info(f"{_YELLOW}AssistantMessage:{_RESET} {text_len} chars")
 
