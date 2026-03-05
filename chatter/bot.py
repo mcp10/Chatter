@@ -8,10 +8,12 @@ import html as _html
 import os
 import json
 import re
+import shlex
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import colorama
@@ -132,6 +134,117 @@ def is_allowed(update: Update) -> bool:
     if _config is None or user is None or chat is None:
         return False
     return user.id == _config.allowed_user_id and chat.type == "private"
+
+
+_PATH_KEYS = {"path", "file_path", "cwd", "notebook_path", "root_path"}
+_PATH_LIST_KEYS = {"paths", "file_paths"}
+_GLOB_META_CHARS = set("*?[]{}")
+
+
+def _repo_root() -> Path:
+    if _config is None:
+        raise RuntimeError("Bot config not initialized")
+    return Path(_config.repo_path).resolve()
+
+
+def _resolve_candidate_path(raw_path: str, repo_root: Path) -> Path:
+    expanded = os.path.expanduser(raw_path.strip())
+    candidate = Path(expanded)
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    return candidate.resolve(strict=False)
+
+
+def _is_within_repo(path: Path, repo_root: Path) -> bool:
+    try:
+        path.relative_to(repo_root)
+        return True
+    except ValueError:
+        return False
+
+
+def _glob_anchor(pattern: str) -> str:
+    first_glob = len(pattern)
+    for idx, char in enumerate(pattern):
+        if char in _GLOB_META_CHARS:
+            first_glob = idx
+            break
+    anchor = pattern[:first_glob].strip()
+    return anchor or "."
+
+
+def _iter_tool_paths(tool_name: str, input_data: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+
+    for key in _PATH_KEYS:
+        value = input_data.get(key)
+        if isinstance(value, str) and value.strip():
+            paths.append(value.strip())
+
+    for key in _PATH_LIST_KEYS:
+        value = input_data.get(key)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    paths.append(item.strip())
+
+    if tool_name == "Glob":
+        pattern = input_data.get("pattern")
+        if isinstance(pattern, str) and pattern.strip():
+            paths.append(_glob_anchor(pattern))
+
+    return paths
+
+
+def _bash_within_repo(command: str, repo_root: Path) -> tuple[bool, str | None]:
+    cmd = command.strip()
+    if not cmd:
+        return True, None
+
+    if re.search(r"(^|[;&|()\s])cd\s+([/~]|\.\.)", cmd):
+        return False, "Bash command attempted to leave the repository."
+
+    try:
+        tokens = shlex.split(cmd, posix=True)
+    except ValueError:
+        tokens = cmd.split()
+
+    prev = ""
+    for token in tokens:
+        if token in {"..", "~"} or token.startswith("../") or token.startswith("~") or "/../" in token or token.endswith("/.."):
+            return False, f"Bash path '{token}' escapes the repository."
+
+        if token.startswith("/"):
+            resolved = _resolve_candidate_path(token, repo_root)
+            if not _is_within_repo(resolved, repo_root):
+                return False, f"Bash path '{token}' is outside the repository."
+
+        if prev == "cd":
+            resolved = _resolve_candidate_path(token, repo_root)
+            if not _is_within_repo(resolved, repo_root):
+                return False, f"Bash cd target '{token}' is outside the repository."
+
+        prev = token
+
+    return True, None
+
+
+def _repo_scope_violation(tool_name: str, input_data: dict[str, Any]) -> str | None:
+    repo_root = _repo_root()
+
+    if tool_name == "Bash":
+        command = str(input_data.get("command", ""))
+        allowed, reason = _bash_within_repo(command, repo_root)
+        if not allowed:
+            return reason
+        return None
+
+    for raw_path in _iter_tool_paths(tool_name, input_data):
+        resolved = _resolve_candidate_path(raw_path, repo_root)
+        if not _is_within_repo(resolved, repo_root):
+            return f"{tool_name} requested '{raw_path}', which is outside {_config.repo_path}."
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +411,11 @@ def _make_can_use_tool(chat_id: int, bot):
         tool_name: str, input_data: dict[str, Any]
     ) -> PermissionResultAllow | PermissionResultDeny:
         s = get_state(chat_id)
+
+        violation = _repo_scope_violation(tool_name, input_data)
+        if violation:
+            log_info(f"{_RED}Blocked (outside repo):{_RESET} {tool_name} - {violation}")
+            return PermissionResultDeny(message=violation)
 
         # Auto-approve safe tools
         if tool_name in SAFE_TOOLS:
