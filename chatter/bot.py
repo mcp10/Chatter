@@ -139,6 +139,9 @@ def is_allowed(update: Update) -> bool:
 _PATH_KEYS = {"path", "file_path", "cwd", "notebook_path", "root_path"}
 _PATH_LIST_KEYS = {"paths", "file_paths"}
 _GLOB_META_CHARS = set("*?[]{}")
+_EMBEDDED_ABS_PATH_RE = re.compile(
+    r"(?:^|[\\s'\"=:(,\\[{])(/[^\\s'\"`|&;()<>]+|~(?:/[^\\s'\"`|&;()<>]*)?)"
+)
 
 
 def _repo_root() -> Path:
@@ -213,6 +216,16 @@ def _bash_within_repo(command: str, repo_root: Path) -> tuple[bool, str | None]:
     for token in tokens:
         if token in {"..", "~"} or token.startswith("../") or token.startswith("~") or "/../" in token or token.endswith("/.."):
             return False, f"Bash path '{token}' escapes the repository."
+
+        # Catch absolute/home paths embedded in arguments, for example:
+        # python -c "open('/etc/passwd')"
+        if "://" not in token:
+            for match in _EMBEDDED_ABS_PATH_RE.finditer(token):
+                raw_path = match.group(1).rstrip(".,:;)]}")
+                if raw_path.startswith("/") or raw_path.startswith("~"):
+                    resolved = _resolve_candidate_path(raw_path, repo_root)
+                    if not _is_within_repo(resolved, repo_root):
+                        return False, f"Bash path '{raw_path}' is outside the repository."
 
         if token.startswith("/"):
             resolved = _resolve_candidate_path(token, repo_root)
@@ -410,6 +423,7 @@ def _make_can_use_tool(chat_id: int, bot):
     async def _can_use_tool_inner(
         tool_name: str, input_data: dict[str, Any]
     ) -> PermissionResultAllow | PermissionResultDeny:
+        log_info(f"{_YELLOW}Tool request:{_RESET} {tool_name}")
         s = get_state(chat_id)
 
         violation = _repo_scope_violation(tool_name, input_data)
@@ -614,7 +628,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             cwd=cwd,
             can_use_tool=_make_can_use_tool(chat_id, context.bot),
             include_partial_messages=True,
-            setting_sources=["user", "project", "local"],
+            # Ignore global user settings to keep the runtime constrained
+            # to this repo's own Claude settings.
+            setting_sources=["project", "local"],
+            add_dirs=[cwd],
+            sandbox={
+                "enabled": True,
+                "autoAllowBashIfSandboxed": False,
+                "allowUnsandboxedCommands": False,
+            },
+            stderr= lambda line: log_info(f"{_RED}STDERR:{_RESET} {line}"),
         )
 
         if s.get("session_id"):
@@ -735,18 +758,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def run_bot(config: BotConfig) -> None:
     global _config
-    _config = config
+    repo_root = str(Path(config.repo_path).resolve())
+    _config = BotConfig(
+        bot_token=config.bot_token,
+        allowed_user_id=config.allowed_user_id,
+        repo_path=repo_root,
+        repo_name=config.repo_name,
+    )
 
     # The SDK closes stdin after this timeout (ms) if it hasn't received a result.
     # Default 60 s is too short when waiting for human approval on Telegram.
     os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", str(APPROVAL_TIMEOUT * 1000 + 60_000))
 
-    app = Application.builder().token(config.bot_token).concurrent_updates(True).build()
+    app = Application.builder().token(_config.bot_token).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CallbackQueryHandler(_approval_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    log_startup(config.allowed_user_id, config.repo_path)
+    log_startup(_config.allowed_user_id, _config.repo_path)
     app.run_polling(drop_pending_updates=True)
