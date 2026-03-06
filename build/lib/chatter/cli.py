@@ -38,7 +38,7 @@ def _import_bot_runtime():
     except ModuleNotFoundError as e:
         if e.name and e.name.startswith("claude_agent_sdk"):
             raise click.ClickException(
-                "Missing runtime dependency 'claude-agent-sdk' required by `chatter`.\n"
+                "Missing runtime dependency 'claude-agent-sdk' required by `chatter start`.\n"
                 f"Interpreter: {sys.executable}\n"
                 "Install it into this interpreter:\n"
                 f'  {sys.executable} -m pip install --upgrade "claude-agent-sdk>=0.1.44"\n'

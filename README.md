@@ -4,7 +4,7 @@ Telegram bot that bridges messages to the local Claude CLI agent.
 
 Requires Python 3.10+.
 
-## Install
+## Quick Install
 
 **macOS / Linux:**
 
@@ -18,11 +18,11 @@ curl -sSL https://raw.githubusercontent.com/mcp10/Chatter/main/install.sh | bash
 irm https://raw.githubusercontent.com/mcp10/Chatter/main/install.ps1 | iex
 ```
 
-**Or manually (any platform):**
+## Quick Start
 
 ```bash
-git clone https://github.com/mcp10/Chatter.git
-python -m pip install --upgrade --force-reinstall ./Chatter
+chatter init
+chatter
 ```
 
 ## Commands
@@ -32,10 +32,19 @@ python -m pip install --upgrade --force-reinstall ./Chatter
 chatter init
 
 # Start the bot (from within the repo directory)
-chatter start
+chatter
 
 # Send a one-off notification
 chatter notify "message"
+```
+
+## Reinstall / Upgrade
+
+Reinstall Chatter into the same Python environment used by the `chatter` command:
+
+```bash
+CHATTER_PY="$(head -n 1 "$(which chatter)" | sed 's|^#!||')"
+"$CHATTER_PY" -m pip install --upgrade --force-reinstall "git+https://github.com/mcp10/Chatter.git"
 ```
 
 ## Config
@@ -93,7 +102,7 @@ No secrets are ever stored inside a repo directory.
 5. **Start the bot**:
 
    ```bash
-   chatter start
+   chatter
    ```
 
 ## Troubleshooting

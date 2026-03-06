@@ -41,7 +41,7 @@ if command -v chatter &>/dev/null; then
     echo "Next steps:"
     echo "  1. cd into your project directory"
     echo "  2. Run: chatter init"
-    echo "  3. Run: chatter start"
+    echo "  3. Run: chatter"
 else
     echo "Warning: 'chatter' command not found in PATH." >&2
     echo "You may need to add your Python scripts directory to PATH." >&2

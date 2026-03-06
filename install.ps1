@@ -53,7 +53,7 @@ if (Get-Command chatter -ErrorAction SilentlyContinue) {
     Write-Host "Next steps:"
     Write-Host "  1. cd into your project directory"
     Write-Host "  2. Run: chatter init"
-    Write-Host "  3. Run: chatter start"
+    Write-Host "  3. Run: chatter"
 } else {
     Write-Error "Warning: 'chatter' command not found in PATH."
     Write-Error "You may need to add your Python scripts directory to PATH."
