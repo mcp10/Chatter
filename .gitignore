@@ -3,6 +3,9 @@
 .venv/
 __pycache__/
 *.pyc
+build/
+dist/
 *.egg-info/
+scripts/
 .claude/
 .DS_Store
