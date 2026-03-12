@@ -49,14 +49,14 @@ jobs:
           if any(line.strip().startswith("version =") for line in project_lines):
               fail("pyproject.toml [project] should not define a hard-coded version.")
 
-          if not any(re.search(r'dynamic\\s*=\\s*\\[[^\\]]*"version"[^\\]]*\\]', line) for line in project_lines):
+          if not any(re.search(r'dynamic\s*=\s*\[[^\]]*"version"[^\]]*\]', line) for line in project_lines):
               fail('pyproject.toml [project] must declare dynamic = ["version"].')
 
           if not any('version = {attr = "chatter.__version__"}' in line for line in dynamic_lines):
               fail('pyproject.toml [tool.setuptools.dynamic] must use version = {attr = "chatter.__version__"}.')
 
           match = re.search(
-              r'^__version__\\s*=\\s*"(?P<version>[^"]+)"\\s*$',
+              r'^__version__\s*=\s*"(?P<version>[^"]+)"\s*$',
               package_init.read_text(),
               flags=re.MULTILINE,
           )
@@ -64,7 +64,7 @@ jobs:
               fail(f"Could not find __version__ in {package_init}")
 
           version = match.group("version")
-          if not re.fullmatch(r"\\d+\\.\\d+\\.\\d+", version):
+          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
               fail(f'chatter.__version__ should look like "X.Y.Z", found "{version}".')
 
           tracked = subprocess.run(

@@ -8,8 +8,10 @@ from pathlib import Path
 
 import click
 
+from .agent import AGENT_CLAUDE, AGENT_CODEX, SUPPORTED_AGENT_BACKENDS, agent_label
 from .claude_auth import format_claude_auth_error, get_claude_auth_status
 from .config import GLOBAL_CONFIG_FILE, ChatterConfig
+from .codex_auth import format_codex_auth_error, get_codex_auth_status
 from .notify import send_startup_notification
 
 MIN_PYTHON = (3, 10)
@@ -34,19 +36,7 @@ def _ensure_supported_python() -> None:
 
 def _import_bot_runtime():
     """Import bot runtime lazily so init/notify still work when bot deps are missing."""
-    try:
-        from .bot import BotConfig, run_bot
-    except ModuleNotFoundError as e:
-        if e.name and e.name.startswith("claude_agent_sdk"):
-            raise click.ClickException(
-                "Missing runtime dependency 'claude-agent-sdk' required by `chatter`.\n"
-                f"Interpreter: {sys.executable}\n"
-                "Install it into this interpreter:\n"
-                f'  {sys.executable} -m pip install --upgrade "claude-agent-sdk>=0.1.44"\n'
-                "If this is an older Chatter install, reinstall Chatter as well:\n"
-                f'  {sys.executable} -m pip install --upgrade --force-reinstall "git+{REPO_URL}"'
-            ) from e
-        raise
+    from .bot import BotConfig, run_bot
     return BotConfig, run_bot
 
 
@@ -54,8 +44,30 @@ def _load_config() -> ChatterConfig:
     """Load the central config, raising ClickException on failure."""
     try:
         return ChatterConfig.load()
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError) as e:
         raise click.ClickException(str(e))
+
+
+def _suggest_agent_backend() -> str:
+    """Pick a sensible init default based on available local logins."""
+    if get_codex_auth_status(timeout_seconds=1.5).ok:
+        return AGENT_CODEX
+    if get_claude_auth_status(timeout_seconds=1.5).ok:
+        return AGENT_CLAUDE
+    return AGENT_CODEX
+
+
+def _ensure_agent_auth(agent_backend: str) -> None:
+    """Fail fast when the selected local agent CLI is unavailable or logged out."""
+    if agent_backend == AGENT_CODEX:
+        auth_status = get_codex_auth_status()
+        if not auth_status.ok:
+            raise click.ClickException(format_codex_auth_error(auth_status))
+        return
+
+    auth_status = get_claude_auth_status()
+    if not auth_status.ok:
+        raise click.ClickException(format_claude_auth_error(auth_status))
 
 
 def _load_repo_config() -> tuple[ChatterConfig, str, "RepoEntry"]:  # noqa: F821
@@ -71,7 +83,7 @@ def _load_repo_config() -> tuple[ChatterConfig, str, "RepoEntry"]:  # noqa: F821
 @click.group(invoke_without_command=True)
 @click.pass_context
 def main(ctx: click.Context) -> None:
-    """Chatter — Telegram bot bridging messages to a local Claude CLI agent."""
+    """Chatter — Telegram bot bridging messages to a local Codex or Claude agent."""
     _ensure_supported_python()
     if ctx.invoked_subcommand is None:
         _run_start()
@@ -110,6 +122,12 @@ def init() -> None:
     bot_token = click.prompt("Enter the Telegram bot token for this repo (from BotFather)")
     default_name = Path.cwd().name
     repo_name = click.prompt("Repo name", default=default_name)
+    agent_backend = click.prompt(
+        "Agent backend",
+        type=click.Choice(SUPPORTED_AGENT_BACKENDS, case_sensitive=False),
+        default=_suggest_agent_backend(),
+        show_choices=True,
+    )
 
     # Warn if a different repo already uses this name
     if repo_name in cfg.repos and os.path.normcase(str(Path(cfg.repos[repo_name].path).resolve())) != cwd_norm:
@@ -119,10 +137,16 @@ def init() -> None:
             abort=True,
         )
 
-    cfg.add_repo(name=repo_name, bot_token=bot_token, path=cwd)
+    cfg.add_repo(
+        name=repo_name,
+        bot_token=bot_token,
+        path=cwd,
+        agent_backend=agent_backend,
+    )
 
     click.echo(
         f"\nChatter registered '{repo_name}' at {cwd}.\n"
+        f"  Agent: {agent_label(agent_backend)}\n"
         f"  Config: {GLOBAL_CONFIG_FILE}\n"
         f"\nRun `chatter` to start the bot."
     )
@@ -131,15 +155,14 @@ def init() -> None:
 def _run_start() -> None:
     """Start the bot for the current repository."""
     cfg, repo_name, repo = _load_repo_config()
-    auth_status = get_claude_auth_status()
-    if not auth_status.ok:
-        raise click.ClickException(format_claude_auth_error(auth_status))
+    _ensure_agent_auth(repo.agent_backend)
     BotConfig, run_bot = _import_bot_runtime()
     config = BotConfig(
         bot_token=repo.bot_token,
         allowed_user_id=cfg.allowed_user_id,
         repo_path=str(Path(repo.path).resolve()),
         repo_name=repo_name,
+        agent_backend=repo.agent_backend,
     )
     run_bot(config)
 
@@ -153,10 +176,11 @@ def start() -> None:
 @main.command()
 @click.argument("context_hint", default="unknown")
 def notify(context_hint: str) -> None:
-    """Send a Telegram startup notification (used by CLAUDE.md)."""
+    """Send a Telegram startup notification (used by CLAUDE.md / AGENTS.md)."""
     cfg, _name, repo = _load_repo_config()
     send_startup_notification(
         bot_token=repo.bot_token,
         chat_id=cfg.allowed_user_id,
         context_hint=context_hint,
+        agent_name=agent_label(repo.agent_backend),
     )

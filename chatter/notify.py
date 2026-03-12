@@ -8,8 +8,13 @@ import urllib.parse
 import urllib.request
 
 
-def send_startup_notification(bot_token: str, chat_id: int, context_hint: str) -> None:
-    message = f"🤖 Claude Code session started\nContext: {context_hint}"
+def send_startup_notification(
+    bot_token: str,
+    chat_id: int,
+    context_hint: str,
+    agent_name: str = "Agent",
+) -> None:
+    message = f"🤖 {agent_name} session started\nContext: {context_hint}"
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": str(chat_id), "text": message}).encode()
     try:

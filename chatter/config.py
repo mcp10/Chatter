@@ -13,6 +13,8 @@ from pathlib import Path
 
 import yaml
 
+from .agent import DEFAULT_AGENT_BACKEND, normalize_agent_backend
+
 GLOBAL_CONFIG_DIR = Path.home() / ".chatter"
 GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / "config.yaml"
 
@@ -21,6 +23,7 @@ GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / "config.yaml"
 class RepoEntry:
     bot_token: str
     path: str
+    agent_backend: str = DEFAULT_AGENT_BACKEND
 
 
 @dataclass
@@ -36,9 +39,15 @@ class ChatterConfig:
             raise FileNotFoundError(
                 f"Config not found at {GLOBAL_CONFIG_FILE}. Run `chatter init` first."
             )
+        if data is None:
+            data = {}
         repos = {}
         for name, entry in (data.get("repos") or {}).items():
-            repos[name] = RepoEntry(bot_token=entry["bot_token"], path=entry["path"])
+            repos[name] = RepoEntry(
+                bot_token=entry["bot_token"],
+                path=entry["path"],
+                agent_backend=normalize_agent_backend(entry.get("agent_backend")),
+            )
         return cls(
             allowed_user_id=int(data["allowed_user_id"]),
             repos=repos,
@@ -49,7 +58,11 @@ class ChatterConfig:
         data = {
             "allowed_user_id": self.allowed_user_id,
             "repos": {
-                name: {"bot_token": entry.bot_token, "path": entry.path}
+                name: {
+                    "bot_token": entry.bot_token,
+                    "path": entry.path,
+                    "agent_backend": normalize_agent_backend(entry.agent_backend),
+                }
                 for name, entry in self.repos.items()
             },
         }
@@ -64,6 +77,16 @@ class ChatterConfig:
             f"No repo registered for {cwd}. Run `chatter init` in this directory first."
         )
 
-    def add_repo(self, name: str, bot_token: str, path: str) -> None:
-        self.repos[name] = RepoEntry(bot_token=bot_token, path=str(Path(path).resolve()))
+    def add_repo(
+        self,
+        name: str,
+        bot_token: str,
+        path: str,
+        agent_backend: str = DEFAULT_AGENT_BACKEND,
+    ) -> None:
+        self.repos[name] = RepoEntry(
+            bot_token=bot_token,
+            path=str(Path(path).resolve()),
+            agent_backend=normalize_agent_backend(agent_backend),
+        )
         self.save()
