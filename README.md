@@ -123,3 +123,16 @@ Then install/reinstall into that same interpreter:
 <python-from-shebang> -m pip install --upgrade "claude-agent-sdk>=0.1.44"
 <python-from-shebang> -m pip install --upgrade --force-reinstall "git+https://github.com/mcp10/Chatter.git"
 ```
+
+### `Fatal error in message reader: Command failed with exit code 1`
+
+If this happens after `AssistantMessage` or `ResultMessage`, you are likely running an
+older Chatter build that sends single Telegram prompts through the SDK's streaming-input
+path. That path is prone to transport shutdown failures in some Claude SDK versions.
+
+Reinstall Chatter into the same Python environment used by the `chatter` command:
+
+```bash
+CHATTER_PY="$(head -n 1 "$(which chatter)" | sed 's|^#!||')"
+"$CHATTER_PY" -m pip install --upgrade --force-reinstall "git+https://github.com/mcp10/Chatter.git"
+```

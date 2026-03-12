@@ -637,6 +637,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             _typing_loop(chat_id, context.bot, stop_typing)
         )
 
+        stderr_lines: list[str] = []
+
+        def _on_stderr(line: str) -> None:
+            stderr_lines.append(line.rstrip())
+            log_info(f"{_RED}STDERR:{_RESET} {line}")
+
         # Build SDK options
         options = ClaudeAgentOptions(
             cwd=cwd,
@@ -651,7 +657,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "autoAllowBashIfSandboxed": False,
                 "allowUnsandboxedCommands": False,
             },
-            stderr= lambda line: log_info(f"{_RED}STDERR:{_RESET} {line}"),
+            stderr=_on_stderr,
         )
 
         if s.get("session_id"):
@@ -663,17 +669,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             log_info("Starting new session")
 
-        # can_use_tool requires streaming mode — wrap the prompt in an async generator.
-        # The SDK (patched) waits for the first result before closing stdin when
-        # can_use_tool is set, so the generator can exhaust normally.
-        async def _prompt_stream():
-            yield {
-                "type": "user",
-                "message": {"role": "user", "content": prompt},
-                "parent_tool_use_id": None,
-                "session_id": s.get("session_id") or "default",
-            }
-
         streaming_text = ""   # accumulated from StreamEvents (real-time)
         final_output = ""     # accumulated from AssistantMessages (authoritative)
         result_text = ""
@@ -682,7 +677,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cancel_reason = "Cancelled."
 
         try:
-            async for message in query(prompt=_prompt_stream(), options=options):
+            # Use the standard one-shot prompt path here. Streaming input is only
+            # needed for multi-message/custom-tool flows, and it is known to hit
+            # SDK transport shutdown bugs for single-prompt sessions.
+            async for message in query(prompt=prompt, options=options):
                 # Check for cancellation
                 if s.get("cancelled"):
                     cancelled = True
@@ -738,9 +736,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             cancelled = True
             cancel_reason = s.get("cancel_reason") or cancel_reason
         except Exception as e:
-            log_info(f"{_RED}SDK error:{_RESET} {e}")
-            if not final_output:
-                final_output = f"Error: {e}"
+            had_output = bool(final_output or result_text)
+            label = "SDK exited after producing output" if had_output else "SDK error"
+            color = _YELLOW if had_output else _RED
+            log_info(f"{color}{label}:{_RESET} {e}")
+            if not had_output:
+                stderr_output = _tail("\n".join(stderr_lines), 1200)
+                if stderr_output:
+                    final_output = f"Error: {e}\n\nstderr:\n{stderr_output}"
+                else:
+                    final_output = f"Error: {e}"
         finally:
             stop_typing.set()
             typing_task.cancel()
