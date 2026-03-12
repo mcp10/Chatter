@@ -116,6 +116,8 @@ SAFE_TOOLS: set[str] = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWr
 # Callback data prefixes for approval inline keyboard buttons
 _CB_APPROVE = "ap"
 _CB_DENY    = "dn"
+_CB_INPUT_CHOICE = "ui"
+_CB_INPUT_CANCEL = "uc"
 
 # Cancel reason used when a newer prompt interrupts the current run
 _INTERRUPT_REASON = "Interrupted by a newer prompt."
@@ -201,6 +203,7 @@ def get_state(chat_id: int) -> dict:
             "cancelled": False,
             "cancel_reason": None,
             "pending_approvals": {},   # approval_id -> asyncio.Future[str]
+            "pending_user_input": None,  # active Codex request_user_input prompt
         }
     return _state[chat_id]
 
@@ -786,6 +789,172 @@ def _codex_failed_item_text(item: dict[str, Any]) -> str | None:
     return None
 
 
+def _format_codex_user_input_prompt(
+    question: dict[str, Any],
+    *,
+    index: int,
+    total: int,
+) -> str:
+    header = str(question.get("header") or "").strip() or "Input required"
+    prompt = str(question.get("question") or "").strip() or "Codex needs more input."
+    options = question.get("options")
+    is_other = bool(question.get("isOther"))
+    is_secret = bool(question.get("isSecret"))
+
+    lines = [f"<b>{_html.escape(header)}</b>"]
+    if total > 1:
+        lines.append(f"Question {index}/{total}")
+    lines.append(_html.escape(prompt))
+
+    if isinstance(options, list) and options:
+        option_lines: list[str] = []
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            label = str(option.get("label") or "").strip()
+            description = str(option.get("description") or "").strip()
+            if not label:
+                continue
+            if description:
+                option_lines.append(
+                    f"• <b>{_html.escape(label)}</b>: {_html.escape(description)}"
+                )
+            else:
+                option_lines.append(f"• <b>{_html.escape(label)}</b>")
+        if option_lines:
+            lines.append("")
+            lines.extend(option_lines)
+        lines.append("")
+        if is_other:
+            lines.append("Tap an option or reply with your own text.")
+        else:
+            lines.append("Tap one of the options below.")
+    else:
+        lines.append("")
+        lines.append("Reply with your answer in your next message.")
+
+    if is_secret:
+        lines.append("")
+        lines.append(
+            "Warning: Telegram replies are visible in chat. Secret input is not hidden here."
+        )
+
+    lines.append("")
+    lines.append("Use /cancel to stop.")
+    return "\n".join(lines)
+
+
+async def _request_codex_user_input(
+    chat_id: int,
+    bot,
+    questions: list[dict[str, Any]],
+) -> dict[str, dict[str, list[str]]] | None:
+    answers: dict[str, dict[str, list[str]]] = {}
+    total = len(questions)
+
+    for index, question in enumerate(questions, start=1):
+        question_id = str(question.get("id") or "").strip()
+        if not question_id:
+            continue
+
+        answer = await _request_codex_user_input_question(
+            chat_id,
+            bot,
+            question,
+            index=index,
+            total=total,
+        )
+        if answer is None:
+            return None
+
+        answers[question_id] = {"answers": [answer]}
+
+    return {"answers": answers}
+
+
+async def _request_codex_user_input_question(
+    chat_id: int,
+    bot,
+    question: dict[str, Any],
+    *,
+    index: int,
+    total: int,
+) -> str | None:
+    s = get_state(chat_id)
+    token = uuid.uuid4().hex[:8]
+    future: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
+
+    raw_options = question.get("options")
+    option_map: dict[str, str] = {}
+    rows: list[list[InlineKeyboardButton]] = []
+    if isinstance(raw_options, list) and raw_options:
+        for option_index, option in enumerate(raw_options):
+            if not isinstance(option, dict):
+                continue
+            label = str(option.get("label") or "").strip()
+            if not label:
+                continue
+            option_key = str(option_index)
+            option_map[option_key] = label
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        label[:48],
+                        callback_data=f"{_CB_INPUT_CHOICE}:{token}:{option_key}",
+                    )
+                ]
+            )
+
+    rows.append(
+        [InlineKeyboardButton("Cancel", callback_data=f"{_CB_INPUT_CANCEL}:{token}")]
+    )
+
+    s["pending_user_input"] = {
+        "token": token,
+        "future": future,
+        "question_id": str(question.get("id") or ""),
+        "allow_text": bool(question.get("isOther")) or not option_map,
+        "is_secret": bool(question.get("isSecret")),
+        "option_map": option_map,
+    }
+
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=_format_codex_user_input_prompt(question, index=index, total=total),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    except Exception:
+        if s.get("pending_user_input", {}).get("token") == token:
+            s["pending_user_input"] = None
+        raise
+
+    deadline = asyncio.get_running_loop().time() + APPROVAL_TIMEOUT
+    try:
+        while not future.done():
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                log_info(f"{_YELLOW}Codex user input timed out:{_RESET} [{token}]")
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="Timed out waiting for input. Cancelling…",
+                    )
+                except Exception:
+                    pass
+                if not future.done():
+                    future.set_result(None)
+                break
+            await asyncio.sleep(min(0.25, remaining))
+
+        return future.result()
+    finally:
+        pending = s.get("pending_user_input")
+        if isinstance(pending, dict) and pending.get("token") == token:
+            s["pending_user_input"] = None
+
+
 async def _request_telegram_approval(
     chat_id: int,
     bot,
@@ -911,6 +1080,13 @@ def _cancel_run(s: dict, *, reason: str) -> bool:
             future.set_result(_APPROVAL_CANCEL)
     s["pending_approvals"].clear()
 
+    pending_input = s.get("pending_user_input")
+    if isinstance(pending_input, dict):
+        future = pending_input.get("future")
+        if future is not None and not future.done():
+            future.set_result(None)
+        s["pending_user_input"] = None
+
     run_task = s.get("run_task")
     if running_backend != AGENT_CODEX and run_task and not run_task.done():
         run_task.cancel()
@@ -925,13 +1101,47 @@ def _cancel_run(s: dict, *, reason: str) -> bool:
     return had_run
 
 
+async def _handle_pending_user_input_message(update: Update) -> bool:
+    message = update.message
+    if message is None:
+        return False
+
+    chat_id = update.effective_chat.id
+    s = get_state(chat_id)
+    pending = s.get("pending_user_input")
+    if not isinstance(pending, dict):
+        return False
+
+    future = pending.get("future")
+    if future is None or future.done():
+        s["pending_user_input"] = None
+        return False
+
+    answer = (message.text or "").strip()
+    if not answer:
+        await message.reply_text("Send a non-empty answer, or /cancel.")
+        return True
+
+    if not pending.get("allow_text"):
+        await message.reply_text("Choose one of the buttons above, or /cancel.")
+        return True
+
+    future.set_result(answer)
+    s["pending_user_input"] = None
+
+    preview = "(secret)" if pending.get("is_secret") else _tail(answer, 120)
+    log_info(f"{_GREEN}Codex user input received:{_RESET} {preview}")
+    await message.reply_text("Received. Continuing…")
+    return True
+
+
 
 # ---------------------------------------------------------------------------
 # Callback handler for inline keyboard approval buttons
 # ---------------------------------------------------------------------------
 
 async def _approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline keyboard button presses for tool approval."""
+    """Handle inline keyboard button presses for tool approval and Codex questions."""
     cb = update.callback_query
     if cb is None:
         return
@@ -968,6 +1178,73 @@ async def _approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await cb.edit_message_text("(expired)")
             except BadRequest:
                 pass
+        return
+
+    if data.startswith(f"{_CB_INPUT_CHOICE}:") or data.startswith(f"{_CB_INPUT_CANCEL}:"):
+        pending = s.get("pending_user_input")
+        if not isinstance(pending, dict):
+            try:
+                await cb.edit_message_text("(expired)")
+            except BadRequest:
+                pass
+            return
+
+        future = pending.get("future")
+        if future is None or future.done():
+            s["pending_user_input"] = None
+            try:
+                await cb.edit_message_text("(expired)")
+            except BadRequest:
+                pass
+            return
+
+        if data.startswith(f"{_CB_INPUT_CANCEL}:"):
+            _, token = data.split(":", 1)
+            if token != pending.get("token"):
+                try:
+                    await cb.edit_message_text("(expired)")
+                except BadRequest:
+                    pass
+                return
+            future.set_result(None)
+            s["pending_user_input"] = None
+            try:
+                await cb.edit_message_text(
+                    f"{cb.message.text_html}\n\n<b>CANCELLED</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except BadRequest:
+                pass
+            log_info(f"{_RED}Codex user input cancelled:{_RESET} [{token}]")
+            return
+
+        _, token, option_key = data.split(":", 2)
+        if token != pending.get("token"):
+            try:
+                await cb.edit_message_text("(expired)")
+            except BadRequest:
+                pass
+            return
+
+        option_map = pending.get("option_map") or {}
+        answer = option_map.get(option_key)
+        if not isinstance(answer, str) or not answer:
+            try:
+                await cb.edit_message_text("(expired)")
+            except BadRequest:
+                pass
+            return
+
+        future.set_result(answer)
+        s["pending_user_input"] = None
+        try:
+            await cb.edit_message_text(
+                f"{cb.message.text_html}\n\n<b>Selected:</b> {_html.escape(answer)}",
+                parse_mode=ParseMode.HTML,
+            )
+        except BadRequest:
+            pass
+        log_info(f"{_GREEN}Codex user input selected:{_RESET} {answer}")
 
 
 # ---------------------------------------------------------------------------
@@ -1004,10 +1281,14 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     s = get_state(update.effective_chat.id)
     backend = _active_backend(s)
+    had_run = False
+    if s.get("running"):
+        had_run = _cancel_run(s, reason="Cancelled by /new.")
     _reset_backend_session(s, backend)
-    await update.message.reply_text(
-        f"{agent_label(backend)} session reset. Next prompt will start a new conversation."
-    )
+    text = f"{agent_label(backend)} session reset. Next prompt will start a new conversation."
+    if had_run:
+        text = f"Cancelled the active run.\n\n{text}"
+    await update.message.reply_text(text)
 
 
 async def agent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1304,8 +1585,27 @@ async def _run_codex_turn(
 
                 if "id" in event and method == "item/tool/requestUserInput":
                     last_host_request = method
-                    log_info(f"{_YELLOW}Codex requested unsupported user input; sending empty response.{_RESET}")
-                    await client.respond(event["id"], result={"answers": {}})
+                    questions = params.get("questions")
+                    valid_questions = [
+                        question
+                        for question in questions
+                        if isinstance(question, dict)
+                    ] if isinstance(questions, list) else []
+                    log_info(
+                        f"{_YELLOW}Codex requested user input:{_RESET} "
+                        f"{len(valid_questions)} question(s)"
+                    )
+                    result = await _request_codex_user_input(
+                        chat_id,
+                        bot,
+                        valid_questions,
+                    )
+                    if result is None:
+                        s["cancelled"] = True
+                        s["cancel_reason"] = "Cancelled while waiting for user input."
+                        await client.respond(event["id"], result={"answers": {}})
+                    else:
+                        await client.respond(event["id"], result=result)
                     continue
 
                 if "id" in event and method == "item/tool/call":
@@ -1656,6 +1956,9 @@ async def _run_claude_turn(
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
+        return
+
+    if await _handle_pending_user_input_message(update):
         return
 
     chat_id = update.effective_chat.id

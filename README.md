@@ -71,7 +71,7 @@ No secrets are ever stored inside a repo directory.
 
 ## Agent Backends
 
-- `codex` runs the local `codex app-server` transport, preserves thread continuity across messages, and now surfaces Codex command/file-change approvals in Telegram.
+- `codex` runs the local `codex app-server` transport, preserves thread continuity across messages, surfaces Codex command/file-change approvals in Telegram, and can now pause for follow-up user input through Telegram buttons or reply text.
 - `claude` keeps the existing Claude SDK bridge, including Telegram approval prompts for write/shell tools.
 - New repos default to the first available logged-in backend, preferring Codex when both are ready.
 - During a Telegram chat, use `/agent codex`, `/agent claude`, or `/agent default` to switch the active backend for that chat without changing the repo default. Each backend keeps its own preserved session state.
