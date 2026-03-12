@@ -372,6 +372,14 @@ def _looks_like_error_text(text: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def _append_note(text: str, note: str | None) -> str:
+    if not note:
+        return text
+    if note in text:
+        return text
+    return f"{text}\n\n{note}"
+
+
 def _log_output_preview(label: str, text: str, *, color: str = _YELLOW) -> None:
     preview = _tail(text.strip(), 1200)
     if preview:
@@ -490,6 +498,8 @@ async def _ensure_claude_auth(update: Update) -> bool:
         return True
 
     message = format_claude_auth_error(status)
+    note = await _available_backend_note(AGENT_CLAUDE)
+    message = _append_note(message, note)
     log_info(f"{_RED}Claude auth check failed:{_RESET}\n{message}")
     if update.message is not None:
         await update.message.reply_text(message)
@@ -503,10 +513,28 @@ async def _ensure_codex_auth(update: Update) -> bool:
         return True
 
     message = format_codex_auth_error(status)
+    note = await _available_backend_note(AGENT_CODEX)
+    message = _append_note(message, note)
     log_info(f"{_RED}Codex auth check failed:{_RESET}\n{message}")
     if update.message is not None:
         await update.message.reply_text(message)
     return False
+
+
+async def _available_backend_note(current_backend: str) -> str | None:
+    if current_backend == AGENT_CODEX:
+        status = await asyncio.to_thread(get_claude_auth_status)
+        if status.ok:
+            return "Claude Code is available via /agent claude."
+        return None
+
+    if current_backend == AGENT_CLAUDE:
+        status = await asyncio.to_thread(get_codex_auth_status)
+        if status.ok:
+            return "Codex is available via /agent codex."
+        return None
+
+    return None
 
 
 async def _ensure_agent_auth(update: Update, backend: str) -> bool:
@@ -2038,6 +2066,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 return
             output = cancel_reason
         if output and _looks_like_error_text(output):
+            output = _append_note(output, await _available_backend_note(backend))
             _log_output_preview("User-visible error", output, color=_RED)
         await send_final(status_msg, update.message, output)
 
