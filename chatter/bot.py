@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram bot that bridges messages to a local Claude CLI agent."""
+"""Telegram bot that bridges messages to a local Codex or Claude agent."""
 
 from __future__ import annotations
 
@@ -30,19 +30,9 @@ from telegram.ext import (
     filters,
 )
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    ResultMessage,
-    SystemMessage,
-)
-from claude_agent_sdk.types import (
-    PermissionResultAllow,
-    PermissionResultDeny,
-    StreamEvent,
-)
+from .agent import AGENT_CLAUDE, AGENT_CODEX, agent_label
 from .claude_auth import format_claude_auth_error, get_claude_auth_status
+from .codex_auth import format_codex_auth_error, get_codex_auth_status
 
 # ---------------------------------------------------------------------------
 # Runtime config (injected by run_bot before the event loop starts)
@@ -54,6 +44,7 @@ class BotConfig:
     allowed_user_id: int
     repo_path: str
     repo_name: str
+    agent_backend: str
 
 _config: BotConfig | None = None
 
@@ -62,8 +53,11 @@ _config: BotConfig | None = None
 # Terminal logging helpers
 # ---------------------------------------------------------------------------
 
-# Enable ANSI colors on Windows (no-op on Unix/macOS and modern Windows Terminal)
-colorama.just_fix_windows_console()
+# Enable ANSI colors on Windows with a fallback for older colorama versions.
+if hasattr(colorama, "just_fix_windows_console"):
+    colorama.just_fix_windows_console()
+else:
+    colorama.init()
 
 _RESET  = "\033[0m"
 _BOLD   = "\033[1m"
@@ -92,8 +86,12 @@ def log_bot(text: str) -> None:
     print(f"{_DIM}{_ts()}{_RESET}  {_GREEN}{_BOLD}[bot → user]{_RESET} {preview}")
 
 
-def log_startup(user_id: int, repo: str) -> None:
-    print(f"\n{_GREEN}{_BOLD}Bot started.{_RESET}  user={_BOLD}{user_id}{_RESET}  repo={repo}\n")
+def log_startup(user_id: int, repo: str, backend: str) -> None:
+    label = agent_label(backend)
+    print(
+        f"\n{_GREEN}{_BOLD}Bot started.{_RESET}  "
+        f"agent={_BOLD}{label}{_RESET}  user={_BOLD}{user_id}{_RESET}  repo={repo}\n"
+    )
 
 
 EDIT_INTERVAL = 2.0       # seconds between live message edits
@@ -126,6 +124,7 @@ def get_state(chat_id: int) -> dict:
             "lock": asyncio.Lock(),
             "running": False,
             "run_task": None,
+            "agent_process": None,
             "session_id": None,
             "session_started": False,
             "cancelled": False,
@@ -423,6 +422,28 @@ async def _ensure_claude_auth(update: Update) -> bool:
     return False
 
 
+async def _ensure_codex_auth(update: Update) -> bool:
+    """Fail fast when the local Codex CLI is logged out."""
+    status = await asyncio.to_thread(get_codex_auth_status)
+    if status.ok:
+        return True
+
+    message = format_codex_auth_error(status)
+    log_info(f"{_RED}Codex auth check failed:{_RESET}\n{message}")
+    if update.message is not None:
+        await update.message.reply_text(message)
+    return False
+
+
+async def _ensure_agent_auth(update: Update) -> bool:
+    """Fail fast when the selected agent CLI is unavailable or logged out."""
+    if _config is None:
+        return False
+    if _config.agent_backend == AGENT_CODEX:
+        return await _ensure_codex_auth(update)
+    return await _ensure_claude_auth(update)
+
+
 # ---------------------------------------------------------------------------
 # Tool approval helpers
 # ---------------------------------------------------------------------------
@@ -458,6 +479,7 @@ def _format_tool_request(tool_name: str, input_data: dict[str, Any]) -> str:
 
 def _make_can_use_tool(chat_id: int, bot):
     """Factory that creates a can_use_tool callback bound to a specific chat."""
+    from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
     async def can_use_tool(
         tool_name: str, input_data: dict[str, Any], context: Any
@@ -563,6 +585,12 @@ def _cancel_run(s: dict, *, reason: str) -> bool:
         run_task.cancel()
         had_run = True
 
+    process = s.get("agent_process")
+    if process and process.returncode is None:
+        with suppress(ProcessLookupError):
+            process.kill()
+        had_run = True
+
     return had_run
 
 
@@ -619,8 +647,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     s = get_state(update.effective_chat.id)
+    label = agent_label(_config.agent_backend)
     await update.message.reply_text(
-        f"Claude agent bridge ready.\n"
+        f"{label} agent bridge ready.\n"
         f"Repo: {_config.repo_name} ({s['cwd']})\n\n"
         f"/cancel  — stop the running agent\n"
         f"/new     — start a fresh conversation\n\n"
@@ -648,8 +677,337 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main message handler — runs Claude via SDK and streams output
+# Main message handler — runs the selected agent and streams output
 # ---------------------------------------------------------------------------
+
+def _display_shell_command(command: str) -> str:
+    """Strip the shell wrapper Codex uses around command execution items."""
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return command
+
+    if len(tokens) >= 3 and tokens[1] == "-lc" and tokens[0].endswith(("sh", "bash", "zsh")):
+        return tokens[2]
+    return command
+
+
+def _codex_status_preview(
+    latest_agent_message: str,
+    current_command: str,
+    current_command_output: str,
+    elapsed: int,
+) -> str:
+    """Choose the most useful live preview for a Codex turn."""
+    if latest_agent_message:
+        return latest_agent_message
+    if current_command:
+        preview = f"$ {current_command}"
+        output = current_command_output.strip()
+        if output:
+            preview = f"{preview}\n\n{_tail(output, 1600)}"
+        return preview
+    return f"⏳ Thinking… ({elapsed}s)"
+
+
+def _build_codex_command(cwd: str, prompt: str, session_id: str | None) -> list[str]:
+    """Build the Codex CLI command for a fresh or resumed turn."""
+    if session_id:
+        log_info(f"Resuming Codex session {_BOLD}{session_id}{_RESET}")
+        return [
+            "codex",
+            "exec",
+            "resume",
+            "--json",
+            "--skip-git-repo-check",
+            session_id,
+            prompt,
+        ]
+
+    log_info("Starting new Codex session")
+    return [
+        "codex",
+        "exec",
+        "--json",
+        "--sandbox",
+        "workspace-write",
+        "--skip-git-repo-check",
+        "--cd",
+        cwd,
+        prompt,
+    ]
+
+
+async def _run_codex_turn(
+    prompt: str,
+    status_msg,
+    start_time: float,
+    s: dict,
+) -> tuple[str, bool, str]:
+    """Run a single Codex turn via `codex exec --json`."""
+    cwd = s["cwd"]
+    command = _build_codex_command(cwd, prompt, s.get("session_id"))
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    s["agent_process"] = process
+
+    latest_agent_message = ""
+    current_command = ""
+    current_command_output = ""
+    last_edit = asyncio.get_running_loop().time()
+    cancelled = False
+    cancel_reason = "Cancelled."
+    stderr_lines: list[str] = []
+    return_code: int | None = None
+
+    async def _read_stderr() -> None:
+        while process.stderr is not None:
+            raw_line = await process.stderr.readline()
+            if not raw_line:
+                break
+            line = raw_line.decode(errors="replace").rstrip()
+            stderr_lines.append(line)
+            log_info(f"{_RED}CODEX STDERR:{_RESET} {line}")
+
+    stderr_task = asyncio.create_task(_read_stderr())
+
+    try:
+        while True:
+            if s.get("cancelled") and process.returncode is None:
+                cancelled = True
+                cancel_reason = s.get("cancel_reason") or cancel_reason
+                with suppress(ProcessLookupError):
+                    process.kill()
+
+            raw_line = b""
+            if process.stdout is not None:
+                try:
+                    raw_line = await asyncio.wait_for(process.stdout.readline(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    raw_line = b""
+
+            if raw_line:
+                decoded = raw_line.decode(errors="replace").strip()
+                try:
+                    event = json.loads(decoded)
+                except json.JSONDecodeError:
+                    log_info(f"{_RED}Codex JSON parse failed:{_RESET} {decoded}")
+                    event = None
+
+                if isinstance(event, dict):
+                    event_type = event.get("type")
+                    if event_type == "thread.started":
+                        thread_id = event.get("thread_id")
+                        if isinstance(thread_id, str) and thread_id:
+                            s["session_id"] = thread_id
+
+                    if event_type in {"item.started", "item.completed"}:
+                        item = event.get("item")
+                        if isinstance(item, dict):
+                            item_type = item.get("type")
+                            if item_type == "command_execution":
+                                display_command = _display_shell_command(str(item.get("command") or ""))
+                                current_command = display_command
+                                current_command_output = str(item.get("aggregated_output") or "")
+                                if event_type == "item.started":
+                                    log_info(f"{_BLUE}Codex command:{_RESET} {display_command}")
+                                else:
+                                    exit_code = item.get("exit_code")
+                                    log_info(
+                                        f"{_BLUE}Codex command done:{_RESET} "
+                                        f"exit={exit_code}  cmd={display_command}"
+                                    )
+                            elif item_type == "agent_message":
+                                text = str(item.get("text") or "").strip()
+                                if text:
+                                    latest_agent_message = text
+                                    log_info(
+                                        f"{_YELLOW}Codex agent message:{_RESET} {len(text)} chars"
+                                    )
+
+                    if event_type == "turn.completed":
+                        break
+
+            elif process.returncode is not None:
+                break
+
+            now = asyncio.get_running_loop().time()
+            if now - last_edit >= EDIT_INTERVAL:
+                elapsed = int(now - start_time)
+                display = _codex_status_preview(
+                    latest_agent_message,
+                    current_command,
+                    current_command_output,
+                    elapsed,
+                )
+                await safe_edit(status_msg, display)
+                last_edit = now
+
+        return_code = await process.wait()
+    except asyncio.CancelledError:
+        cancelled = True
+        cancel_reason = s.get("cancel_reason") or cancel_reason
+        if process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.kill()
+            with suppress(Exception):
+                await process.wait()
+    finally:
+        with suppress(asyncio.CancelledError):
+            await stderr_task
+        s["agent_process"] = None
+
+    output = latest_agent_message or current_command_output.strip()
+    if return_code and not output and not cancelled:
+        stderr_output = _tail("\n".join(stderr_lines), 1200)
+        if stderr_output:
+            output = f"Error: Codex exited with code {return_code}\n\nstderr:\n{stderr_output}"
+        else:
+            output = f"Error: Codex exited with code {return_code}"
+
+    return output, cancelled, cancel_reason
+
+
+async def _run_claude_turn(
+    prompt: str,
+    chat_id: int,
+    bot,
+    status_msg,
+    start_time: float,
+    s: dict,
+) -> tuple[str, bool, str]:
+    """Run a single Claude SDK turn."""
+    try:
+        from claude_agent_sdk import (
+            AssistantMessage,
+            ClaudeAgentOptions,
+            ClaudeSDKClient,
+            ResultMessage,
+            SystemMessage,
+        )
+        from claude_agent_sdk.types import StreamEvent
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.startswith("claude_agent_sdk"):
+            return (
+                "Error: Missing runtime dependency 'claude-agent-sdk'.\n\n"
+                "Install it into the Python environment that runs `chatter`, then retry.",
+                False,
+                "Cancelled.",
+            )
+        raise
+
+    cwd = s["cwd"]
+    stderr_lines: list[str] = []
+
+    def _on_stderr(line: str) -> None:
+        stderr_lines.append(line.rstrip())
+        log_info(f"{_RED}STDERR:{_RESET} {line}")
+
+    options = ClaudeAgentOptions(
+        cwd=cwd,
+        can_use_tool=_make_can_use_tool(chat_id, bot),
+        include_partial_messages=True,
+        setting_sources=["project", "local"],
+        add_dirs=[cwd],
+        sandbox={
+            "enabled": True,
+            "autoAllowBashIfSandboxed": False,
+            "allowUnsandboxedCommands": False,
+        },
+        stderr=_on_stderr,
+    )
+
+    if s.get("session_id"):
+        options.resume = s["session_id"]
+        log_info(f"Resuming session {_BOLD}{s['session_id']}{_RESET}")
+    elif s.get("session_started"):
+        options.continue_conversation = True
+        log_info("Continuing conversation")
+    else:
+        log_info("Starting new session")
+
+    streaming_text = ""
+    final_output = ""
+    result_text = ""
+    last_edit = asyncio.get_running_loop().time()
+    cancelled = False
+    cancel_reason = "Cancelled."
+
+    try:
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt, session_id=s.get("session_id") or "default")
+
+            async for message in client.receive_response():
+                if s.get("cancelled"):
+                    cancelled = True
+                    cancel_reason = s.get("cancel_reason") or cancel_reason
+                    break
+
+                if isinstance(message, StreamEvent):
+                    event = message.event
+                    event_type = event.get("type", "")
+                    if event_type == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            streaming_text += delta.get("text", "")
+                    elif event_type == "content_block_start":
+                        block = event.get("content_block", {})
+                        if block.get("type") == "tool_use":
+                            log_info(f"{_BLUE}Tool call:{_RESET} {block.get('name', '?')}")
+
+                elif isinstance(message, AssistantMessage):
+                    text_len = 0
+                    for block in message.content:
+                        if hasattr(block, "text"):
+                            final_output += block.text
+                            text_len += len(block.text)
+                    streaming_text = ""
+                    log_info(f"{_YELLOW}AssistantMessage:{_RESET} {text_len} chars")
+
+                elif isinstance(message, ResultMessage):
+                    s["session_id"] = message.session_id or s.get("session_id")
+                    result_text = message.result or ""
+                    s["session_started"] = True
+                    log_info(
+                        f"{_GREEN}ResultMessage:{_RESET} "
+                        f"session={s['session_id']}  result={len(result_text)} chars"
+                    )
+
+                elif isinstance(message, SystemMessage):
+                    log_info(f"{_DIM}SystemMessage:{_RESET} subtype={message.subtype}")
+                    if message.subtype == "init" and hasattr(message, "data"):
+                        session_id = (message.data or {}).get("session_id")
+                        if session_id:
+                            s["session_id"] = session_id
+
+                now = asyncio.get_running_loop().time()
+                if now - last_edit >= EDIT_INTERVAL:
+                    elapsed = int(now - start_time)
+                    display = (final_output + streaming_text) or f"⏳ Thinking… ({elapsed}s)"
+                    await safe_edit(status_msg, display)
+                    last_edit = now
+
+    except asyncio.CancelledError:
+        cancelled = True
+        cancel_reason = s.get("cancel_reason") or cancel_reason
+    except Exception as exc:
+        had_output = bool(final_output or result_text)
+        label = "SDK exited after producing output" if had_output else "SDK error"
+        color = _YELLOW if had_output else _RED
+        log_info(f"{color}{label}:{_RESET} {exc}")
+        if not had_output:
+            stderr_output = _tail("\n".join(stderr_lines), 1200)
+            if stderr_output:
+                final_output = f"Error: {exc}\n\nstderr:\n{stderr_output}"
+            else:
+                final_output = f"Error: {exc}"
+
+    return final_output or result_text, cancelled, cancel_reason
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
@@ -659,16 +1017,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     s = get_state(chat_id)
     lock: asyncio.Lock = s["lock"]
 
-    # Keep at most one active run per chat: interrupt the previous one if needed.
     if lock.locked():
         _cancel_run(s, reason=_INTERRUPT_REASON)
 
     async with lock:
         prompt = update.message.text
-        cwd = s["cwd"]
         log_user(update.effective_user.id, prompt)
 
-        if not await _ensure_claude_auth(update):
+        if not await _ensure_agent_auth(update):
             s["running"] = False
             s["run_task"] = None
             return
@@ -680,119 +1036,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         start_time = asyncio.get_running_loop().time()
         status_msg = await update.message.reply_text("⏳ Thinking… (0s)")
         stop_typing = asyncio.Event()
-        typing_task = asyncio.create_task(
-            _typing_loop(chat_id, context.bot, stop_typing)
-        )
+        typing_task = asyncio.create_task(_typing_loop(chat_id, context.bot, stop_typing))
 
-        stderr_lines: list[str] = []
-
-        def _on_stderr(line: str) -> None:
-            stderr_lines.append(line.rstrip())
-            log_info(f"{_RED}STDERR:{_RESET} {line}")
-
-        # Build SDK options
-        options = ClaudeAgentOptions(
-            cwd=cwd,
-            can_use_tool=_make_can_use_tool(chat_id, context.bot),
-            include_partial_messages=True,
-            # Ignore global user settings to keep the runtime constrained
-            # to this repo's own Claude settings.
-            setting_sources=["project", "local"],
-            add_dirs=[cwd],
-            sandbox={
-                "enabled": True,
-                "autoAllowBashIfSandboxed": False,
-                "allowUnsandboxedCommands": False,
-            },
-            stderr=_on_stderr,
-        )
-
-        if s.get("session_id"):
-            options.resume = s["session_id"]
-            log_info(f"Resuming session {_BOLD}{s['session_id']}{_RESET}")
-        elif s.get("session_started"):
-            options.continue_conversation = True
-            log_info("Continuing conversation")
-        else:
-            log_info("Starting new session")
-
-        streaming_text = ""   # accumulated from StreamEvents (real-time)
-        final_output = ""     # accumulated from AssistantMessages (authoritative)
-        result_text = ""
-        last_edit = asyncio.get_running_loop().time()
+        output = ""
         cancelled = False
         cancel_reason = "Cancelled."
 
         try:
-            async with ClaudeSDKClient(options=options) as client:
-                await client.query(prompt, session_id=s.get("session_id") or "default")
-
-                async for message in client.receive_response():
-                    # Check for cancellation
-                    if s.get("cancelled"):
-                        cancelled = True
-                        cancel_reason = s.get("cancel_reason") or cancel_reason
-                        break
-
-                    if isinstance(message, StreamEvent):
-                        # Real-time text deltas for live preview
-                        event = message.event
-                        etype = event.get("type", "")
-                        if etype == "content_block_delta":
-                            delta = event.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                streaming_text += delta.get("text", "")
-                        elif etype == "content_block_start":
-                            block = event.get("content_block", {})
-                            btype = block.get("type", "")
-                            if btype == "tool_use":
-                                log_info(f"{_BLUE}Tool call:{_RESET} {block.get('name', '?')}")
-
-                    elif isinstance(message, AssistantMessage):
-                        # Authoritative full text — replaces streaming accumulator
-                        text_len = 0
-                        for block in message.content:
-                            if hasattr(block, "text"):
-                                final_output += block.text
-                                text_len += len(block.text)
-                        streaming_text = ""
-                        log_info(f"{_YELLOW}AssistantMessage:{_RESET} {text_len} chars")
-
-                    elif isinstance(message, ResultMessage):
-                        s["session_id"] = message.session_id or s.get("session_id")
-                        result_text = message.result or ""
-                        s["session_started"] = True
-                        log_info(f"{_GREEN}ResultMessage:{_RESET} session={s['session_id']}  result={len(result_text)} chars")
-
-                    elif isinstance(message, SystemMessage):
-                        log_info(f"{_DIM}SystemMessage:{_RESET} subtype={message.subtype}")
-                        if message.subtype == "init" and hasattr(message, "data"):
-                            sid = (message.data or {}).get("session_id")
-                            if sid:
-                                s["session_id"] = sid
-
-                    # Live-edit the status message
-                    now = asyncio.get_running_loop().time()
-                    if now - last_edit >= EDIT_INTERVAL:
-                        elapsed = int(now - start_time)
-                        display = (final_output + streaming_text) or f"⏳ Thinking… ({elapsed}s)"
-                        await safe_edit(status_msg, display)
-                        last_edit = now
-
-        except asyncio.CancelledError:
-            cancelled = True
-            cancel_reason = s.get("cancel_reason") or cancel_reason
-        except Exception as e:
-            had_output = bool(final_output or result_text)
-            label = "SDK exited after producing output" if had_output else "SDK error"
-            color = _YELLOW if had_output else _RED
-            log_info(f"{color}{label}:{_RESET} {e}")
-            if not had_output:
-                stderr_output = _tail("\n".join(stderr_lines), 1200)
-                if stderr_output:
-                    final_output = f"Error: {e}\n\nstderr:\n{stderr_output}"
-                else:
-                    final_output = f"Error: {e}"
+            if _config.agent_backend == AGENT_CODEX:
+                output, cancelled, cancel_reason = await _run_codex_turn(
+                    prompt,
+                    status_msg,
+                    start_time,
+                    s,
+                )
+            else:
+                output, cancelled, cancel_reason = await _run_claude_turn(
+                    prompt,
+                    chat_id,
+                    context.bot,
+                    status_msg,
+                    start_time,
+                    s,
+                )
         finally:
             stop_typing.set()
             typing_task.cancel()
@@ -801,16 +1067,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             if s.get("run_task") is asyncio.current_task():
                 s["run_task"] = None
+            s["agent_process"] = None
             s["running"] = False
             s["cancelled"] = False
             s["cancel_reason"] = None
-            log_info(f"Done. session={s.get('session_id')}  out={len(final_output)}  result={len(result_text)}")
+            log_info(f"Done. session={s.get('session_id')}  out={len(output)}")
 
-        output = final_output or result_text
         if cancelled and not output:
             if cancel_reason == _INTERRUPT_REASON:
-                # Silently remove the Thinking indicator — the new query will
-                # send its own, so the user never sees two Thinking bubbles.
                 with suppress(Exception):
                     await status_msg.delete()
                 return
@@ -832,11 +1096,16 @@ def run_bot(config: BotConfig) -> None:
         allowed_user_id=config.allowed_user_id,
         repo_path=repo_root,
         repo_name=config.repo_name,
+        agent_backend=config.agent_backend,
     )
 
-    # The SDK closes stdin after this timeout (ms) if it hasn't received a result.
-    # Default 60 s is too short when waiting for human approval on Telegram.
-    os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", str(APPROVAL_TIMEOUT * 1000 + 60_000))
+    if _config.agent_backend == AGENT_CLAUDE:
+        # The SDK closes stdin after this timeout (ms) if it hasn't received a result.
+        # Default 60 s is too short when waiting for human approval on Telegram.
+        os.environ.setdefault(
+            "CLAUDE_CODE_STREAM_CLOSE_TIMEOUT",
+            str(APPROVAL_TIMEOUT * 1000 + 60_000),
+        )
 
     app = Application.builder().token(_config.bot_token).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start_cmd))
@@ -845,5 +1114,5 @@ def run_bot(config: BotConfig) -> None:
     app.add_handler(CallbackQueryHandler(_approval_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    log_startup(_config.allowed_user_id, _config.repo_path)
+    log_startup(_config.allowed_user_id, _config.repo_path, _config.agent_backend)
     app.run_polling(drop_pending_updates=True)

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "chatter"
 dynamic = ["version"]
-description = "Telegram bot that bridges messages to a local Claude CLI agent"
+description = "Telegram bot that bridges messages to a local Codex or Claude agent"
 requires-python = ">=3.10"
 dependencies = [
     "python-telegram-bot>=20.0",

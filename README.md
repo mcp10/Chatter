@@ -1,6 +1,6 @@
 # Chatter
 
-Telegram bot that bridges messages to the local Claude CLI agent.
+Telegram bot that bridges messages to a local Codex or Claude agent.
 
 Requires Python 3.10+.
 
@@ -24,6 +24,9 @@ irm https://raw.githubusercontent.com/mcp10/Chatter/main/install.ps1 | iex
 chatter init
 chatter
 ```
+
+`chatter init` now prompts for the repo's agent backend. Existing config entries that
+do not have `agent_backend` continue to use Claude for backward compatibility.
 
 ## Commands
 
@@ -61,9 +64,16 @@ repos:
   MyProject:
     bot_token: "123:ABC..."
     path: "/Users/you/projects/MyProject"
+    agent_backend: "codex"
 ```
 
 No secrets are ever stored inside a repo directory.
+
+## Agent Backends
+
+- `codex` runs the local `codex` CLI through `codex exec --json` and preserves session continuity with `codex exec resume`.
+- `claude` keeps the existing Claude SDK bridge, including Telegram approval prompts for write/shell tools.
+- New repos default to the first available logged-in backend, preferring Codex when both are ready.
 
 ## Adding Chatter to a new project
 
@@ -86,9 +96,10 @@ No secrets are ever stored inside a repo directory.
    chatter init
    ```
 
-   This registers the directory in `~/.chatter/config.yaml`. No files are created in the repo.
+   This registers the directory in `~/.chatter/config.yaml` and stores the selected
+   `agent_backend`. No files are created in the repo.
 
-4. **Add the startup hook to `CLAUDE.md`** in the new project:
+4. **Add the startup hook to your agent instructions file** (`CLAUDE.md`, `AGENTS.md`, etc.):
 
    ```markdown
    ## Session startup notification
@@ -107,10 +118,25 @@ No secrets are ever stored inside a repo directory.
 
 ## Troubleshooting
 
+### `Codex login required.`
+
+The selected repo backend is `codex`, but the local Codex CLI is missing or logged out.
+
+```bash
+codex login
+```
+
+If you prefer API-key auth instead of ChatGPT login:
+
+```bash
+printenv OPENAI_API_KEY | codex login --with-api-key
+```
+
 ### `ModuleNotFoundError: No module named 'claude_agent_sdk'`
 
-This means the `chatter` launcher is running under a Python environment that does not
-have Chatter's runtime dependencies installed.
+This only affects repos configured with the `claude` backend. It means the `chatter`
+launcher is running under a Python environment that does not have Chatter's runtime
+dependencies installed.
 
 ```bash
 which chatter
