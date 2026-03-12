@@ -8,6 +8,9 @@ Single config file at ~/.chatter/config.yaml stores everything:
 from __future__ import annotations
 
 import os
+import stat
+import warnings
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,6 +20,31 @@ from .agent import DEFAULT_AGENT_BACKEND, normalize_agent_backend
 
 GLOBAL_CONFIG_DIR = Path.home() / ".chatter"
 GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / "config.yaml"
+GLOBAL_LOG_DIR = GLOBAL_CONFIG_DIR / "logs"
+
+# Permission bits that indicate group/other access
+_TOO_OPEN = stat.S_IRGRP | stat.S_IWGRP | stat.S_IROTH | stat.S_IWOTH
+
+
+def _secure_path(path: Path, mode: int) -> None:
+    """Set file/directory permissions, ignoring errors on non-Unix systems."""
+    with suppress(OSError):
+        os.chmod(path, mode)
+
+
+def _check_permissions(path: Path) -> None:
+    """Warn if a file is readable by group or others."""
+    try:
+        file_mode = path.stat().st_mode
+        if file_mode & _TOO_OPEN:
+            warnings.warn(
+                f"Config file {path} has overly permissive permissions "
+                f"(mode {oct(file_mode & 0o777)}). "
+                f"Run: chmod 600 {path}",
+                stacklevel=3,
+            )
+    except OSError:
+        pass
 
 
 @dataclass
@@ -32,13 +60,17 @@ class ChatterConfig:
     repos: dict[str, RepoEntry] = field(default_factory=dict)
 
     @classmethod
-    def load(cls) -> "ChatterConfig":
+    def load(cls) -> ChatterConfig:
         try:
             data = yaml.safe_load(GLOBAL_CONFIG_FILE.read_text())
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
             raise FileNotFoundError(
                 f"Config not found at {GLOBAL_CONFIG_FILE}. Run `chatter init` first."
-            )
+            ) from exc
+
+        # Warn if config file has overly permissive permissions (Unix only)
+        _check_permissions(GLOBAL_CONFIG_FILE)
+
         if data is None:
             data = {}
         repos = {}
@@ -55,6 +87,7 @@ class ChatterConfig:
 
     def save(self) -> None:
         GLOBAL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        _secure_path(GLOBAL_CONFIG_DIR, 0o700)
         data = {
             "allowed_user_id": self.allowed_user_id,
             "repos": {
@@ -67,6 +100,7 @@ class ChatterConfig:
             },
         }
         GLOBAL_CONFIG_FILE.write_text(yaml.dump(data, default_flow_style=False))
+        _secure_path(GLOBAL_CONFIG_FILE, 0o600)
 
     def find_repo_by_cwd(self) -> tuple[str, RepoEntry]:
         cwd = os.path.normcase(str(Path.cwd().resolve()))

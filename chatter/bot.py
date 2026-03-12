@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import html as _html
-import os
 import json
+import os
 import re
 import shlex
 import uuid
@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 import colorama
-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, RetryAfter
@@ -37,6 +36,7 @@ from .agent import (
     agent_label,
     normalize_agent_backend,
 )
+from .audit import AuditLogger
 from .claude_auth import format_claude_auth_error, get_claude_auth_status
 from .codex_app_server import CodexAppServerClient, CodexAppServerError
 from .codex_auth import format_codex_auth_error, get_codex_auth_status
@@ -54,6 +54,7 @@ class BotConfig:
     agent_backend: str
 
 _config: BotConfig | None = None
+_audit: AuditLogger | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -213,14 +214,17 @@ def is_allowed(update: Update) -> bool:
     chat = update.effective_chat
     if _config is None or user is None or chat is None:
         return False
-    return user.id == _config.allowed_user_id and chat.type == "private"
+    allowed = user.id == _config.allowed_user_id and chat.type == "private"
+    if not allowed and _audit is not None:
+        _audit.log_auth_failure(user.id, chat.type)
+    return allowed
 
 
 _PATH_KEYS = {"path", "file_path", "cwd", "notebook_path", "root_path"}
 _PATH_LIST_KEYS = {"paths", "file_paths"}
 _GLOB_META_CHARS = set("*?[]{}")
 _EMBEDDED_ABS_PATH_RE = re.compile(
-    r"(?:^|[\\s'\"=:(,\\[{])(/[^\\s'\"`|&;()<>]+|~(?:/[^\\s'\"`|&;()<>]*)?)"
+    r"(?:^|[\s'\"=:(,\[{])(/[^\s'\"`|&;()<>]+|~(?:/[^\s'\"`|&;()<>]*)?)"
 )
 
 
@@ -1059,16 +1063,22 @@ def _make_can_use_tool(chat_id: int, bot):
         tool_name: str, input_data: dict[str, Any]
     ) -> PermissionResultAllow | PermissionResultDeny:
         log_info(f"{_YELLOW}Tool request:{_RESET} {tool_name}")
+        if _audit:
+            _audit.log_tool_request(chat_id, tool_name, input_data)
         s = get_state(chat_id)
 
         violation = _repo_scope_violation(tool_name, input_data)
         if violation:
             log_info(f"{_RED}Blocked (outside repo):{_RESET} {tool_name} - {violation}")
+            if _audit:
+                _audit.log_scope_violation(chat_id, tool_name, violation)
             return PermissionResultDeny(message=violation)
 
         # Auto-approve safe tools
         if tool_name in SAFE_TOOLS:
             log_info(f"{_GREEN}Auto-approved:{_RESET} {tool_name}")
+            if _audit:
+                _audit.log_approval(chat_id, tool_name, "auto_approved")
             return PermissionResultAllow(updated_input=input_data)
 
         text = _format_tool_request(tool_name, input_data)
@@ -1081,16 +1091,24 @@ def _make_can_use_tool(chat_id: int, bot):
             )
         except ApprovalRequestError as exc:
             log_info(f"{_RED}Failed to send approval message:{_RESET} {exc}")
+            if _audit:
+                _audit.log_error(chat_id, f"Approval request failed: {exc}")
             return PermissionResultDeny(message=str(exc))
 
         if decision == _APPROVAL_APPROVE:
             log_info(f"{_GREEN}Approved:{_RESET} {tool_name}")
+            if _audit:
+                _audit.log_approval(chat_id, tool_name, "approved")
             return PermissionResultAllow(updated_input=input_data)
         elif decision == _APPROVAL_CANCEL:
             log_info(f"{_RED}Cancelled:{_RESET} {tool_name}")
+            if _audit:
+                _audit.log_approval(chat_id, tool_name, "cancelled")
             return PermissionResultDeny(message=f"User cancelled {tool_name}")
         else:
             log_info(f"{_RED}Denied:{_RESET} {tool_name}")
+            if _audit:
+                _audit.log_approval(chat_id, tool_name, "denied")
             return PermissionResultDeny(message=f"User denied {tool_name}")
 
     return can_use_tool
@@ -1999,6 +2017,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     async with lock:
         prompt = update.message.text
         log_user(update.effective_user.id, prompt)
+        if _audit:
+            _audit.log_message(chat_id, update.effective_user.id, prompt)
         backend = _active_backend(s)
         session = _get_backend_session(s, backend)
 
@@ -2076,7 +2096,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ---------------------------------------------------------------------------
 
 def run_bot(config: BotConfig) -> None:
-    global _config
+    global _config, _audit
     repo_root = str(Path(config.repo_path).resolve())
     _config = BotConfig(
         bot_token=config.bot_token,
@@ -2101,5 +2121,7 @@ def run_bot(config: BotConfig) -> None:
     app.add_handler(CallbackQueryHandler(_approval_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    _audit = AuditLogger()
+    _audit.log_startup(_config.allowed_user_id, _config.repo_path, _config.agent_backend)
     log_startup(_config.allowed_user_id, _config.repo_path, _config.agent_backend)
     app.run_polling(drop_pending_updates=True)

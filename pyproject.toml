@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "chatter"
 dynamic = ["version"]
 description = "Telegram bot that bridges messages to a local Codex or Claude agent"
+license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
     "python-telegram-bot>=20.0",
@@ -13,6 +14,15 @@ dependencies = [
     "pyyaml>=5.1",
     "claude-agent-sdk>=0.1.44",
     "colorama>=0.4.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "pip-audit>=2.7",
 ]
 
 [project.scripts]
@@ -24,3 +34,13 @@ version = {attr = "chatter.__version__"}
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["chatter*"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
