@@ -87,6 +87,11 @@ def log_user(user_id: int, text: str) -> None:
     print(f"{_DIM}{_ts()}{_RESET}  {_CYAN}{_BOLD}[user {user_id}]{_RESET} {text}")
 
 
+def log_bot(text: str) -> None:
+    preview = _tail(text.strip(), 1200)
+    print(f"{_DIM}{_ts()}{_RESET}  {_GREEN}{_BOLD}[bot → user]{_RESET} {preview}")
+
+
 def log_startup(user_id: int, repo: str) -> None:
     print(f"\n{_GREEN}{_BOLD}Bot started.{_RESET}  user={_BOLD}{user_id}{_RESET}  repo={repo}\n")
 
@@ -396,8 +401,10 @@ async def send_final(status_msg, reply_to, text: str) -> None:
     except Exception:
         pass
     if not text:
+        log_bot("(no output)")
         await reply_to.reply_text("(no output)")
         return
+    log_bot(text)
     chunks = [text[i:i + MAX_MSG_LEN] for i in range(0, len(text), MAX_MSG_LEN)]
     for chunk in chunks:
         await reply_to.reply_text(md_to_html(chunk), parse_mode=ParseMode.HTML)
