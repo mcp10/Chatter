@@ -33,15 +33,16 @@ from telegram.ext import (
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     ResultMessage,
     SystemMessage,
-    query,
 )
 from claude_agent_sdk.types import (
     PermissionResultAllow,
     PermissionResultDeny,
     StreamEvent,
 )
+from .claude_auth import format_claude_auth_error, get_claude_auth_status
 
 # ---------------------------------------------------------------------------
 # Runtime config (injected by run_bot before the event loop starts)
@@ -278,6 +279,27 @@ def _tail(text: str, limit: int) -> str:
     return text
 
 
+def _looks_like_error_text(text: str) -> bool:
+    lowered = text.lower()
+    markers = (
+        "error:",
+        "failed to",
+        '"type":"error"',
+        '"type": "error"',
+        "authentication_error",
+        "oauth token has expired",
+        "permission denied",
+        "timed out",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _log_output_preview(label: str, text: str, *, color: str = _YELLOW) -> None:
+    preview = _tail(text.strip(), 1200)
+    if preview:
+        log_info(f"{color}{label}:{_RESET}\n{preview}")
+
+
 def to_pre(text: str) -> str:
     """Wrap text in an HTML <pre> block — used for live streaming previews."""
     return f"<pre>{_html.escape(text)}</pre>"
@@ -379,6 +401,19 @@ async def send_final(status_msg, reply_to, text: str) -> None:
     chunks = [text[i:i + MAX_MSG_LEN] for i in range(0, len(text), MAX_MSG_LEN)]
     for chunk in chunks:
         await reply_to.reply_text(md_to_html(chunk), parse_mode=ParseMode.HTML)
+
+
+async def _ensure_claude_auth(update: Update) -> bool:
+    """Fail fast when the local Claude Code CLI is logged out."""
+    status = await asyncio.to_thread(get_claude_auth_status)
+    if status.ok:
+        return True
+
+    message = format_claude_auth_error(status)
+    log_info(f"{_RED}Claude auth check failed:{_RESET}\n{message}")
+    if update.message is not None:
+        await update.message.reply_text(message)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +661,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cwd = s["cwd"]
         log_user(update.effective_user.id, prompt)
 
+        if not await _ensure_claude_auth(update):
+            s["running"] = False
+            s["run_task"] = None
+            return
+
         s["running"] = True
         s["cancelled"] = False
         s["cancel_reason"] = None
@@ -677,60 +717,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cancel_reason = "Cancelled."
 
         try:
-            # Use the standard one-shot prompt path here. Streaming input is only
-            # needed for multi-message/custom-tool flows, and it is known to hit
-            # SDK transport shutdown bugs for single-prompt sessions.
-            async for message in query(prompt=prompt, options=options):
-                # Check for cancellation
-                if s.get("cancelled"):
-                    cancelled = True
-                    cancel_reason = s.get("cancel_reason") or cancel_reason
-                    break
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query(prompt, session_id=s.get("session_id") or "default")
 
-                if isinstance(message, StreamEvent):
-                    # Real-time text deltas for live preview
-                    event = message.event
-                    etype = event.get("type", "")
-                    if etype == "content_block_delta":
-                        delta = event.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            streaming_text += delta.get("text", "")
-                    elif etype == "content_block_start":
-                        block = event.get("content_block", {})
-                        btype = block.get("type", "")
-                        if btype == "tool_use":
-                            log_info(f"{_BLUE}Tool call:{_RESET} {block.get('name', '?')}")
+                async for message in client.receive_response():
+                    # Check for cancellation
+                    if s.get("cancelled"):
+                        cancelled = True
+                        cancel_reason = s.get("cancel_reason") or cancel_reason
+                        break
 
-                elif isinstance(message, AssistantMessage):
-                    # Authoritative full text — replaces streaming accumulator
-                    text_len = 0
-                    for block in message.content:
-                        if hasattr(block, "text"):
-                            final_output += block.text
-                            text_len += len(block.text)
-                    streaming_text = ""
-                    log_info(f"{_YELLOW}AssistantMessage:{_RESET} {text_len} chars")
+                    if isinstance(message, StreamEvent):
+                        # Real-time text deltas for live preview
+                        event = message.event
+                        etype = event.get("type", "")
+                        if etype == "content_block_delta":
+                            delta = event.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                streaming_text += delta.get("text", "")
+                        elif etype == "content_block_start":
+                            block = event.get("content_block", {})
+                            btype = block.get("type", "")
+                            if btype == "tool_use":
+                                log_info(f"{_BLUE}Tool call:{_RESET} {block.get('name', '?')}")
 
-                elif isinstance(message, ResultMessage):
-                    s["session_id"] = message.session_id or s.get("session_id")
-                    result_text = message.result or ""
-                    s["session_started"] = True
-                    log_info(f"{_GREEN}ResultMessage:{_RESET} session={s['session_id']}  result={len(result_text)} chars")
+                    elif isinstance(message, AssistantMessage):
+                        # Authoritative full text — replaces streaming accumulator
+                        text_len = 0
+                        for block in message.content:
+                            if hasattr(block, "text"):
+                                final_output += block.text
+                                text_len += len(block.text)
+                        streaming_text = ""
+                        log_info(f"{_YELLOW}AssistantMessage:{_RESET} {text_len} chars")
 
-                elif isinstance(message, SystemMessage):
-                    log_info(f"{_DIM}SystemMessage:{_RESET} subtype={message.subtype}")
-                    if message.subtype == "init" and hasattr(message, "data"):
-                        sid = (message.data or {}).get("session_id")
-                        if sid:
-                            s["session_id"] = sid
+                    elif isinstance(message, ResultMessage):
+                        s["session_id"] = message.session_id or s.get("session_id")
+                        result_text = message.result or ""
+                        s["session_started"] = True
+                        log_info(f"{_GREEN}ResultMessage:{_RESET} session={s['session_id']}  result={len(result_text)} chars")
 
-                # Live-edit the status message
-                now = asyncio.get_running_loop().time()
-                if now - last_edit >= EDIT_INTERVAL:
-                    elapsed = int(now - start_time)
-                    display = (final_output + streaming_text) or f"⏳ Thinking… ({elapsed}s)"
-                    await safe_edit(status_msg, display)
-                    last_edit = now
+                    elif isinstance(message, SystemMessage):
+                        log_info(f"{_DIM}SystemMessage:{_RESET} subtype={message.subtype}")
+                        if message.subtype == "init" and hasattr(message, "data"):
+                            sid = (message.data or {}).get("session_id")
+                            if sid:
+                                s["session_id"] = sid
+
+                    # Live-edit the status message
+                    now = asyncio.get_running_loop().time()
+                    if now - last_edit >= EDIT_INTERVAL:
+                        elapsed = int(now - start_time)
+                        display = (final_output + streaming_text) or f"⏳ Thinking… ({elapsed}s)"
+                        await safe_edit(status_msg, display)
+                        last_edit = now
 
         except asyncio.CancelledError:
             cancelled = True
@@ -768,6 +808,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await status_msg.delete()
                 return
             output = cancel_reason
+        if output and _looks_like_error_text(output):
+            _log_output_preview("User-visible error", output, color=_RED)
         await send_final(status_msg, update.message, output)
 
 

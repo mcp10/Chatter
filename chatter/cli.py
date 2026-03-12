@@ -8,6 +8,7 @@ from pathlib import Path
 
 import click
 
+from .claude_auth import format_claude_auth_error, get_claude_auth_status
 from .config import GLOBAL_CONFIG_FILE, ChatterConfig
 from .notify import send_startup_notification
 
@@ -130,6 +131,9 @@ def init() -> None:
 def _run_start() -> None:
     """Start the bot for the current repository."""
     cfg, repo_name, repo = _load_repo_config()
+    auth_status = get_claude_auth_status()
+    if not auth_status.ok:
+        raise click.ClickException(format_claude_auth_error(auth_status))
     BotConfig, run_bot = _import_bot_runtime()
     config = BotConfig(
         bot_token=repo.bot_token,
