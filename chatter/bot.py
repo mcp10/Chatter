@@ -30,8 +30,15 @@ from telegram.ext import (
     filters,
 )
 
-from .agent import AGENT_CLAUDE, AGENT_CODEX, agent_label
+from .agent import (
+    AGENT_CLAUDE,
+    AGENT_CODEX,
+    SUPPORTED_AGENT_BACKENDS,
+    agent_label,
+    normalize_agent_backend,
+)
 from .claude_auth import format_claude_auth_error, get_claude_auth_status
+from .codex_app_server import CodexAppServerClient, CodexAppServerError
 from .codex_auth import format_codex_auth_error, get_codex_auth_status
 
 # ---------------------------------------------------------------------------
@@ -99,6 +106,10 @@ MAX_MSG_LEN = 3500        # headroom for HTML escaping overhead (Telegram limit 
 APPROVAL_TIMEOUT = 600    # seconds to wait for user approval before auto-deny (10 min)
 MAX_APPROVAL_PREVIEW = 1200  # keep approval prompts comfortably under Telegram limits
 
+_APPROVAL_APPROVE = "approve"
+_APPROVAL_DENY = "deny"
+_APPROVAL_CANCEL = "cancel"
+
 # Tools that are auto-approved (read-only / non-destructive)
 SAFE_TOOLS: set[str] = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite"}
 
@@ -117,19 +128,79 @@ _INTERRUPT_REASON = "Interrupted by a newer prompt."
 _state: dict = {}
 
 
+def _new_backend_session() -> dict[str, Any]:
+    return {
+        "session_id": None,
+        "session_started": False,
+    }
+
+
+def _active_backend(s: dict[str, Any]) -> str:
+    override = s.get("backend_override")
+    if override:
+        return override
+    if _config is None:
+        raise RuntimeError("Bot config not initialized")
+    return _config.agent_backend
+
+
+def _get_backend_session(s: dict[str, Any], backend: str) -> dict[str, Any]:
+    sessions = s.setdefault("backend_sessions", {})
+    return sessions.setdefault(backend, _new_backend_session())
+
+
+def _reset_backend_session(s: dict[str, Any], backend: str) -> None:
+    s.setdefault("backend_sessions", {})[backend] = _new_backend_session()
+
+
+def _describe_backend_session(s: dict[str, Any], backend: str) -> str:
+    session = _get_backend_session(s, backend)
+    if session.get("session_id") or session.get("session_started"):
+        return "active"
+    return "fresh"
+
+
+def _format_agent_status(s: dict[str, Any]) -> str:
+    default_backend = _config.agent_backend
+    active_backend = _active_backend(s)
+    override = s.get("backend_override")
+    lines = [
+        f"Current backend: {agent_label(active_backend)}",
+        f"Repo default: {agent_label(default_backend)}",
+    ]
+    if override:
+        lines.append(f"Chat override: {agent_label(override)}")
+    else:
+        lines.append("Chat override: none")
+
+    for backend in SUPPORTED_AGENT_BACKENDS:
+        lines.append(
+            f"{agent_label(backend)} session: {_describe_backend_session(s, backend)}"
+        )
+
+    lines.append("")
+    lines.append("Use /agent codex, /agent claude, or /agent default.")
+    return "\n".join(lines)
+
+
 def get_state(chat_id: int) -> dict:
     if chat_id not in _state:
         _state[chat_id] = {
             "cwd": _config.repo_path,
             "lock": asyncio.Lock(),
             "running": False,
+            "running_backend": None,
             "run_task": None,
             "agent_process": None,
-            "session_id": None,
-            "session_started": False,
+            "codex_client": None,
+            "backend_override": None,
+            "backend_sessions": {
+                AGENT_CODEX: _new_backend_session(),
+                AGENT_CLAUDE: _new_backend_session(),
+            },
             "cancelled": False,
             "cancel_reason": None,
-            "pending_approvals": {},   # approval_id -> asyncio.Future
+            "pending_approvals": {},   # approval_id -> asyncio.Future[str]
         }
     return _state[chat_id]
 
@@ -435,18 +506,31 @@ async def _ensure_codex_auth(update: Update) -> bool:
     return False
 
 
-async def _ensure_agent_auth(update: Update) -> bool:
+async def _ensure_agent_auth(update: Update, backend: str) -> bool:
     """Fail fast when the selected agent CLI is unavailable or logged out."""
-    if _config is None:
-        return False
-    if _config.agent_backend == AGENT_CODEX:
+    if backend == AGENT_CODEX:
         return await _ensure_codex_auth(update)
     return await _ensure_claude_auth(update)
+
+
+def _get_codex_client(s: dict[str, Any]) -> CodexAppServerClient:
+    client = s.get("codex_client")
+    if client is None:
+        client = CodexAppServerClient(
+            s["cwd"],
+            stderr_callback=lambda line: log_info(f"{_RED}CODEX STDERR:{_RESET} {line}"),
+        )
+        s["codex_client"] = client
+    return client
 
 
 # ---------------------------------------------------------------------------
 # Tool approval helpers
 # ---------------------------------------------------------------------------
+
+class ApprovalRequestError(RuntimeError):
+    """Raised when the Telegram approval prompt cannot be delivered."""
+
 
 def _format_tool_request(tool_name: str, input_data: dict[str, Any]) -> str:
     """Format a tool approval request for Telegram display."""
@@ -475,6 +559,289 @@ def _format_tool_request(tool_name: str, input_data: dict[str, Any]) -> str:
         parts.append(f"<pre>{_html.escape(summary)}</pre>")
 
     return "\n".join(parts)
+
+
+def _format_codex_command_request(params: dict[str, Any]) -> str:
+    network_context = params.get("networkApprovalContext")
+    if isinstance(network_context, dict) and network_context:
+        return _format_tool_request("SandboxNetworkAccess", network_context)
+
+    input_data: dict[str, Any] = {
+        "command": _display_shell_command(str(params.get("command") or "")),
+    }
+    reason = params.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        input_data["description"] = reason.strip()
+    return _format_tool_request("Bash", input_data)
+
+
+def _format_codex_legacy_command_request(params: dict[str, Any]) -> str:
+    command = params.get("command")
+    if isinstance(command, list):
+        rendered = shlex.join([str(part) for part in command])
+    else:
+        rendered = str(command or "")
+
+    input_data: dict[str, Any] = {
+        "command": _display_shell_command(rendered),
+    }
+    reason = params.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        input_data["description"] = reason.strip()
+    return _format_tool_request("Bash", input_data)
+
+
+def _format_codex_file_change_request(
+    params: dict[str, Any],
+    known_item: dict[str, Any] | None,
+) -> str:
+    parts = ["<b>Tool: FileChange</b>\n"]
+
+    reason = params.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        parts.append(f"{_html.escape(_tail(reason.strip(), 300))}\n")
+
+    grant_root = params.get("grantRoot")
+    if isinstance(grant_root, str) and grant_root.strip():
+        parts.append(f"Grant root: <code>{_html.escape(grant_root.strip())}</code>\n")
+
+    changes = known_item.get("changes") if isinstance(known_item, dict) else None
+    if isinstance(changes, list) and changes:
+        preview_parts: list[str] = []
+        for change in changes[:4]:
+            if not isinstance(change, dict):
+                continue
+            path = str(change.get("path") or "")
+            kind = change.get("kind")
+            if isinstance(kind, dict):
+                kind_label = str(kind.get("type") or "update")
+            else:
+                kind_label = str(kind or "update")
+            diff = str(change.get("diff") or "").strip()
+            snippet = f"{kind_label}: {path}"
+            if diff:
+                snippet = f"{snippet}\n{diff}"
+            preview_parts.append(snippet)
+
+        if preview_parts:
+            preview = _tail("\n\n".join(preview_parts), MAX_APPROVAL_PREVIEW)
+            parts.append(f"<pre>{_html.escape(preview)}</pre>")
+            return "\n".join(parts)
+
+    summary = _tail(json.dumps(params, indent=2, default=str), 500)
+    parts.append(f"<pre>{_html.escape(summary)}</pre>")
+    return "\n".join(parts)
+
+
+def _format_codex_legacy_file_change_request(params: dict[str, Any]) -> str:
+    parts = ["<b>Tool: FileChange</b>\n"]
+
+    reason = params.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        parts.append(f"{_html.escape(_tail(reason.strip(), 300))}\n")
+
+    grant_root = params.get("grantRoot")
+    if isinstance(grant_root, str) and grant_root.strip():
+        parts.append(f"Grant root: <code>{_html.escape(grant_root.strip())}</code>\n")
+
+    file_changes = params.get("fileChanges")
+    if isinstance(file_changes, dict) and file_changes:
+        preview_parts: list[str] = []
+        for path, change in list(file_changes.items())[:4]:
+            if not isinstance(change, dict):
+                continue
+
+            change_type = str(change.get("type") or "update")
+            snippet = f"{change_type}: {path}"
+            if change_type == "update":
+                move_path = str(change.get("move_path") or "").strip()
+                if move_path:
+                    snippet = f"{snippet} -> {move_path}"
+                diff = str(change.get("unified_diff") or "").strip()
+                if diff:
+                    snippet = f"{snippet}\n{diff}"
+            else:
+                content = str(change.get("content") or "").strip()
+                if content:
+                    snippet = f"{snippet}\n{content}"
+            preview_parts.append(snippet)
+
+        if preview_parts:
+            preview = _tail("\n\n".join(preview_parts), MAX_APPROVAL_PREVIEW)
+            parts.append(f"<pre>{_html.escape(preview)}</pre>")
+            return "\n".join(parts)
+
+    summary = _tail(json.dumps(params, indent=2, default=str), 500)
+    parts.append(f"<pre>{_html.escape(summary)}</pre>")
+    return "\n".join(parts)
+
+
+def _format_codex_approval_request(
+    method: str,
+    params: dict[str, Any],
+    known_item: dict[str, Any] | None,
+) -> str:
+    if method == "item/commandExecution/requestApproval":
+        return _format_codex_command_request(params)
+    if method == "execCommandApproval":
+        return _format_codex_legacy_command_request(params)
+    if method == "item/fileChange/requestApproval":
+        return _format_codex_file_change_request(params, known_item)
+    return _format_codex_legacy_file_change_request(params)
+
+
+def _codex_approval_label(method: str) -> str:
+    if method in {"item/commandExecution/requestApproval", "execCommandApproval"}:
+        return "Codex command"
+    return "Codex file change"
+
+
+def _codex_approval_result(method: str, decision: str) -> str:
+    if method in {"execCommandApproval", "applyPatchApproval"}:
+        if decision == _APPROVAL_APPROVE:
+            return "approved"
+        if decision == _APPROVAL_CANCEL:
+            return "abort"
+        return "denied"
+
+    if decision == _APPROVAL_APPROVE:
+        return "accept"
+    if decision == _APPROVAL_CANCEL:
+        return "cancel"
+    return "decline"
+
+
+def _codex_error_text(error: Any) -> str | None:
+    if not isinstance(error, dict):
+        if error is None:
+            return None
+        return str(error)
+
+    parts: list[str] = []
+    message = error.get("message")
+    if isinstance(message, str) and message.strip():
+        parts.append(message.strip())
+
+    details = error.get("additionalDetails")
+    if isinstance(details, str) and details.strip():
+        parts.append(details.strip())
+
+    if parts:
+        return "\n\n".join(parts)
+
+    codex_error_info = error.get("codexErrorInfo")
+    if codex_error_info is not None:
+        return json.dumps(codex_error_info, default=str)
+    return json.dumps(error, default=str)
+
+
+def _codex_dynamic_tool_result(tool_name: str) -> dict[str, Any]:
+    normalized = tool_name.strip().lower()
+    if normalized == "update_plan":
+        return {"success": True, "contentItems": []}
+
+    return {
+        "success": True,
+        "contentItems": [
+            {
+                "type": "inputText",
+                "text": (
+                    f"Tool '{tool_name or 'unknown'}' is unavailable in Chatter Telegram mode. "
+                    "Continue without it and answer using the available Codex tools."
+                ),
+            }
+        ],
+    }
+
+
+def _codex_failed_item_text(item: dict[str, Any]) -> str | None:
+    item_type = str(item.get("type") or "")
+
+    if item_type == "dynamicToolCall":
+        tool_name = str(item.get("tool") or "unknown")
+        if item.get("success") is False or str(item.get("status") or "") == "failed":
+            return f"Codex dynamic tool '{tool_name}' failed."
+        return None
+
+    if item_type == "mcpToolCall":
+        error = item.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        if item.get("error") is not None:
+            return f"MCP tool '{item.get('tool')}' failed."
+        return None
+
+    if item_type == "commandExecution" and str(item.get("status") or "") in {"failed", "declined"}:
+        command = _display_shell_command(str(item.get("command") or ""))
+        exit_code = item.get("exitCode")
+        if exit_code is not None:
+            return f"Command failed with exit code {exit_code}: {command}"
+        return f"Command failed: {command}"
+
+    if item_type == "fileChange" and str(item.get("status") or "") == "failed":
+        return "Codex file change failed."
+
+    return None
+
+
+async def _request_telegram_approval(
+    chat_id: int,
+    bot,
+    *,
+    label: str,
+    text: str,
+) -> str:
+    s = get_state(chat_id)
+    approval_id = uuid.uuid4().hex[:8]
+    future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    s["pending_approvals"][approval_id] = future
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Approve", callback_data=f"{_CB_APPROVE}:{approval_id}"),
+            InlineKeyboardButton("Deny", callback_data=f"{_CB_DENY}:{approval_id}"),
+        ]
+    ])
+
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    except Exception as exc:
+        if not future.done():
+            future.cancel()
+        s["pending_approvals"].pop(approval_id, None)
+        raise ApprovalRequestError(f"Could not send approval request: {exc}") from exc
+
+    log_info(f"{_YELLOW}Approval requested:{_RESET} {label} [{approval_id}]")
+
+    deadline = asyncio.get_running_loop().time() + APPROVAL_TIMEOUT
+    try:
+        while not future.done():
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                log_info(f"Approval timed out: {approval_id}")
+                try:
+                    await bot.send_message(chat_id=chat_id, text="Timed out — auto-denied.")
+                except Exception:
+                    pass
+                if not future.done():
+                    future.set_result(_APPROVAL_DENY)
+                break
+            await asyncio.sleep(min(0.25, remaining))
+
+        decision = future.result()
+    finally:
+        s["pending_approvals"].pop(approval_id, None)
+
+    if not isinstance(decision, str):
+        return _APPROVAL_DENY
+    return decision
 
 
 def _make_can_use_tool(chat_id: int, bot):
@@ -507,63 +874,26 @@ def _make_can_use_tool(chat_id: int, bot):
             log_info(f"{_GREEN}Auto-approved:{_RESET} {tool_name}")
             return PermissionResultAllow(updated_input=input_data)
 
-        # Request approval via Telegram inline keyboard
-        approval_id = uuid.uuid4().hex[:8]
-        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-        s["pending_approvals"][approval_id] = future
-
         text = _format_tool_request(tool_name, input_data)
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Approve", callback_data=f"{_CB_APPROVE}:{approval_id}"),
-                InlineKeyboardButton("Deny",    callback_data=f"{_CB_DENY}:{approval_id}"),
-            ]
-        ])
-
         try:
-            await bot.send_message(
-                chat_id=chat_id,
+            decision = await _request_telegram_approval(
+                chat_id,
+                bot,
+                label=tool_name,
                 text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard,
             )
-        except Exception as e:
-            log_info(f"{_RED}Failed to send approval message:{_RESET} {e}")
-            if not future.done():
-                future.cancel()
-            s["pending_approvals"].pop(approval_id, None)
-            return PermissionResultDeny(message=f"Could not send approval request: {e}")
+        except ApprovalRequestError as exc:
+            log_info(f"{_RED}Failed to send approval message:{_RESET} {exc}")
+            return PermissionResultDeny(message=str(exc))
 
-        log_info(f"{_YELLOW}Approval requested:{_RESET} {tool_name} [{approval_id}]")
-
-        # Wait for the user to tap Approve / Deny.
-        # Use a plain loop + short sleeps instead of asyncio.wait_for to avoid
-        # creating internal asyncio Tasks that conflict with anyio's TaskGroup.
-        deadline = asyncio.get_running_loop().time() + APPROVAL_TIMEOUT
-        try:
-            while not future.done():
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    log_info(f"Approval timed out: {approval_id}")
-                    try:
-                        await bot.send_message(chat_id=chat_id, text="Timed out — auto-denied.")
-                    except Exception:
-                        pass
-                    # Complete the future to avoid leaving it pending on timeout.
-                    if not future.done():
-                        future.set_result(False)
-                    return PermissionResultDeny(message="Approval timed out")
-                await asyncio.sleep(min(0.25, remaining))
-
-            approved = future.result()
-        finally:
-            s["pending_approvals"].pop(approval_id, None)
-
-        if approved:
-            log_info(f"{_GREEN}Approved:{_RESET} {tool_name} [{approval_id}]")
+        if decision == _APPROVAL_APPROVE:
+            log_info(f"{_GREEN}Approved:{_RESET} {tool_name}")
             return PermissionResultAllow(updated_input=input_data)
+        elif decision == _APPROVAL_CANCEL:
+            log_info(f"{_RED}Cancelled:{_RESET} {tool_name}")
+            return PermissionResultDeny(message=f"User cancelled {tool_name}")
         else:
-            log_info(f"{_RED}Denied:{_RESET} {tool_name} [{approval_id}]")
+            log_info(f"{_RED}Denied:{_RESET} {tool_name}")
             return PermissionResultDeny(message=f"User denied {tool_name}")
 
     return can_use_tool
@@ -574,19 +904,20 @@ def _cancel_run(s: dict, *, reason: str) -> bool:
     had_run = bool(s.get("running"))
     s["cancelled"] = True
     s["cancel_reason"] = reason
+    running_backend = s.get("running_backend")
 
     for future in s["pending_approvals"].values():
         if not future.done():
-            future.set_result(False)
+            future.set_result(_APPROVAL_CANCEL)
     s["pending_approvals"].clear()
 
     run_task = s.get("run_task")
-    if run_task and not run_task.done():
+    if running_backend != AGENT_CODEX and run_task and not run_task.done():
         run_task.cancel()
         had_run = True
 
     process = s.get("agent_process")
-    if process and process.returncode is None:
+    if running_backend != AGENT_CODEX and process and process.returncode is None:
         with suppress(ProcessLookupError):
             process.kill()
         had_run = True
@@ -619,11 +950,11 @@ async def _approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if data.startswith(f"{_CB_APPROVE}:") or data.startswith(f"{_CB_DENY}:"):
         prefix, approval_id = data.split(":", 1)
-        approved = prefix == _CB_APPROVE
+        decision = _APPROVAL_APPROVE if prefix == _CB_APPROVE else _APPROVAL_DENY
         future = s["pending_approvals"].get(approval_id)
         if future and not future.done():
-            future.set_result(approved)
-            label = "APPROVED" if approved else "DENIED"
+            future.set_result(decision)
+            label = "APPROVED" if decision == _APPROVAL_APPROVE else "DENIED"
             try:
                 await cb.edit_message_text(
                     f"{cb.message.text_html}\n\n<b>{label}</b>",
@@ -647,10 +978,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     s = get_state(update.effective_chat.id)
-    label = agent_label(_config.agent_backend)
+    label = agent_label(_active_backend(s))
     await update.message.reply_text(
         f"{label} agent bridge ready.\n"
         f"Repo: {_config.repo_name} ({s['cwd']})\n\n"
+        f"/agent  — show or switch backend\n"
         f"/cancel  — stop the running agent\n"
         f"/new     — start a fresh conversation\n\n"
         f"Just send a prompt to start."
@@ -671,9 +1003,70 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     s = get_state(update.effective_chat.id)
-    s["session_id"] = None
-    s["session_started"] = False
-    await update.message.reply_text("Session reset. Next prompt will start a new conversation.")
+    backend = _active_backend(s)
+    _reset_backend_session(s, backend)
+    await update.message.reply_text(
+        f"{agent_label(backend)} session reset. Next prompt will start a new conversation."
+    )
+
+
+async def agent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+
+    s = get_state(update.effective_chat.id)
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(_format_agent_status(s))
+        return
+
+    if len(args) != 1:
+        await update.message.reply_text("Usage: /agent [codex|claude|default]")
+        return
+
+    raw_target = args[0].strip()
+    use_default = raw_target.lower() == "default"
+    try:
+        target_backend = (
+            _config.agent_backend
+            if use_default
+            else normalize_agent_backend(raw_target)
+        )
+    except ValueError:
+        await update.message.reply_text("Usage: /agent [codex|claude|default]")
+        return
+
+    if not await _ensure_agent_auth(update, target_backend):
+        return
+
+    previous_backend = _active_backend(s)
+    had_run = False
+    if s.get("running"):
+        had_run = _cancel_run(
+            s,
+            reason=f"Backend switched to {agent_label(target_backend)}.",
+        )
+
+    s["backend_override"] = None if target_backend == _config.agent_backend else target_backend
+
+    if previous_backend == target_backend:
+        message = _format_agent_status(s)
+        if had_run:
+            message = f"Cancelled the active run.\n\n{message}"
+        await update.message.reply_text(message)
+        return
+
+    lines = [
+        f"Switched backend from {agent_label(previous_backend)} to {agent_label(target_backend)}.",
+    ]
+    if had_run:
+        lines.append("Cancelled the active run.")
+    lines.append(
+        f"{agent_label(target_backend)} session is {_describe_backend_session(s, target_backend)}."
+    )
+    lines.append("")
+    lines.append(_format_agent_status(s))
+    await update.message.reply_text("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -710,164 +1103,414 @@ def _codex_status_preview(
     return f"⏳ Thinking… ({elapsed}s)"
 
 
-def _build_codex_command(cwd: str, prompt: str, session_id: str | None) -> list[str]:
-    """Build the Codex CLI command for a fresh or resumed turn."""
-    if session_id:
-        log_info(f"Resuming Codex session {_BOLD}{session_id}{_RESET}")
-        return [
-            "codex",
-            "exec",
-            "resume",
-            "--json",
-            "--skip-git-repo-check",
-            session_id,
-            prompt,
-        ]
+def _codex_thread_params(cwd: str) -> dict[str, Any]:
+    return {
+        "cwd": cwd,
+        "sandbox": "workspace-write",
+        "approvalPolicy": "untrusted",
+        "persistExtendedHistory": True,
+        "config": {
+            "apps": {
+                "_default": {
+                    "default_tools_approval_mode": "prompt",
+                    "default_tools_enabled": True,
+                }
+            }
+        },
+    }
 
-    log_info("Starting new Codex session")
-    return [
-        "codex",
-        "exec",
-        "--json",
-        "--sandbox",
-        "workspace-write",
-        "--skip-git-repo-check",
-        "--cd",
-        cwd,
-        prompt,
-    ]
+
+def _codex_turn_params(thread_id: str, prompt: str) -> dict[str, Any]:
+    return {
+        "threadId": thread_id,
+        "approvalPolicy": "untrusted",
+        "input": [
+            {
+                "type": "text",
+                "text": prompt,
+                "text_elements": [],
+            }
+        ],
+    }
+
+
+def _codex_turn_error_text(turn: dict[str, Any] | None) -> str | None:
+    if not isinstance(turn, dict):
+        return None
+
+    return _codex_error_text(turn.get("error"))
 
 
 async def _run_codex_turn(
     prompt: str,
+    chat_id: int,
+    bot,
     status_msg,
     start_time: float,
     s: dict,
+    session: dict[str, Any],
 ) -> tuple[str, bool, str]:
-    """Run a single Codex turn via `codex exec --json`."""
+    """Run a single Codex turn via the persistent app-server transport."""
     cwd = s["cwd"]
-    command = _build_codex_command(cwd, prompt, s.get("session_id"))
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    s["agent_process"] = process
+    client = _get_codex_client(s)
+    client.drain_events()
 
+    thread_id = str(session.get("session_id") or "")
+    turn_id = ""
     latest_agent_message = ""
     current_command = ""
     current_command_output = ""
+    current_command_item_id = ""
+    agent_messages: dict[str, str] = {}
+    command_outputs: dict[str, str] = {}
+    known_items: dict[str, dict[str, Any]] = {}
     last_edit = asyncio.get_running_loop().time()
     cancelled = False
     cancel_reason = "Cancelled."
-    stderr_lines: list[str] = []
-    return_code: int | None = None
-
-    async def _read_stderr() -> None:
-        while process.stderr is not None:
-            raw_line = await process.stderr.readline()
-            if not raw_line:
-                break
-            line = raw_line.decode(errors="replace").rstrip()
-            stderr_lines.append(line)
-            log_info(f"{_RED}CODEX STDERR:{_RESET} {line}")
-
-    stderr_task = asyncio.create_task(_read_stderr())
+    turn_status = ""
+    turn_error_text: str | None = None
+    interrupt_requested = False
+    last_host_request = ""
 
     try:
+        thread_params = _codex_thread_params(cwd)
+        thread_result: dict[str, Any] | None = None
+
+        if thread_id:
+            log_info(f"Resuming Codex session {_BOLD}{thread_id}{_RESET}")
+            try:
+                thread_result = await client.request(
+                    "thread/resume",
+                    {
+                        **thread_params,
+                        "threadId": thread_id,
+                    },
+                    timeout=15.0,
+                )
+            except CodexAppServerError as exc:
+                log_info(
+                    f"{_YELLOW}Codex resume failed; starting fresh instead:{_RESET} {exc}"
+                )
+                session["session_id"] = None
+                session["session_started"] = False
+                thread_id = ""
+
+        if not thread_id:
+            log_info("Starting new Codex session")
+            thread_result = await client.request(
+                "thread/start",
+                {
+                    **thread_params,
+                    "experimentalRawEvents": False,
+                },
+                timeout=15.0,
+            )
+
+        if isinstance(thread_result, dict):
+            thread = thread_result.get("thread")
+            if isinstance(thread, dict):
+                started_thread_id = thread.get("id")
+                if isinstance(started_thread_id, str) and started_thread_id:
+                    thread_id = started_thread_id
+                    session["session_id"] = thread_id
+                    session["session_started"] = True
+
+        if not thread_id:
+            return "Error: Codex did not return a thread id.", False, cancel_reason
+
+        turn_result = await client.request(
+            "turn/start",
+            _codex_turn_params(thread_id, prompt),
+            timeout=15.0,
+        )
+        if isinstance(turn_result, dict):
+            turn = turn_result.get("turn")
+            if isinstance(turn, dict):
+                started_turn_id = turn.get("id")
+                if isinstance(started_turn_id, str) and started_turn_id:
+                    turn_id = started_turn_id
+
         while True:
-            if s.get("cancelled") and process.returncode is None:
+            if s.get("cancelled") and turn_id and not interrupt_requested:
                 cancelled = True
                 cancel_reason = s.get("cancel_reason") or cancel_reason
-                with suppress(ProcessLookupError):
-                    process.kill()
+                interrupt_requested = True
+                log_info(f"{_YELLOW}Interrupting Codex turn:{_RESET} {turn_id}")
+                await client.interrupt_turn(thread_id, turn_id)
 
-            raw_line = b""
-            if process.stdout is not None:
-                try:
-                    raw_line = await asyncio.wait_for(process.stdout.readline(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    raw_line = b""
+            event: dict[str, Any] | None = None
+            try:
+                event = await client.next_event(timeout=0.25)
+            except asyncio.TimeoutError:
+                event = None
 
-            if raw_line:
-                decoded = raw_line.decode(errors="replace").strip()
-                try:
-                    event = json.loads(decoded)
-                except json.JSONDecodeError:
-                    log_info(f"{_RED}Codex JSON parse failed:{_RESET} {decoded}")
-                    event = None
+            if event is not None:
+                method = str(event.get("method") or "")
+                params = event.get("params")
+                if not isinstance(params, dict):
+                    params = {}
 
-                if isinstance(event, dict):
-                    event_type = event.get("type")
-                    if event_type == "thread.started":
-                        thread_id = event.get("thread_id")
-                        if isinstance(thread_id, str) and thread_id:
-                            s["session_id"] = thread_id
+                event_thread_id = params.get("threadId")
+                if isinstance(event_thread_id, str) and event_thread_id and event_thread_id != thread_id:
+                    continue
 
-                    if event_type in {"item.started", "item.completed"}:
-                        item = event.get("item")
-                        if isinstance(item, dict):
-                            item_type = item.get("type")
-                            if item_type == "command_execution":
-                                display_command = _display_shell_command(str(item.get("command") or ""))
-                                current_command = display_command
-                                current_command_output = str(item.get("aggregated_output") or "")
-                                if event_type == "item.started":
-                                    log_info(f"{_BLUE}Codex command:{_RESET} {display_command}")
-                                else:
-                                    exit_code = item.get("exit_code")
-                                    log_info(
-                                        f"{_BLUE}Codex command done:{_RESET} "
-                                        f"exit={exit_code}  cmd={display_command}"
-                                    )
-                            elif item_type == "agent_message":
-                                text = str(item.get("text") or "").strip()
-                                if text:
-                                    latest_agent_message = text
-                                    log_info(
-                                        f"{_YELLOW}Codex agent message:{_RESET} {len(text)} chars"
-                                    )
+                event_turn_id = ""
+                if isinstance(params.get("turnId"), str):
+                    event_turn_id = params["turnId"]
+                elif isinstance(params.get("turn"), dict):
+                    candidate_turn_id = params["turn"].get("id")
+                    if isinstance(candidate_turn_id, str):
+                        event_turn_id = candidate_turn_id
+                if turn_id and event_turn_id and event_turn_id != turn_id:
+                    continue
 
-                    if event_type == "turn.completed":
-                        break
+                if "id" in event and method in {
+                    "item/commandExecution/requestApproval",
+                    "item/fileChange/requestApproval",
+                    "execCommandApproval",
+                    "applyPatchApproval",
+                }:
+                    last_host_request = method
+                    known_item = known_items.get(str(params.get("itemId") or ""))
+                    text = _format_codex_approval_request(method, params, known_item)
+                    label = _codex_approval_label(method)
+                    try:
+                        decision = await _request_telegram_approval(
+                            chat_id,
+                            bot,
+                            label=label,
+                            text=text,
+                        )
+                    except ApprovalRequestError as exc:
+                        log_info(f"{_RED}Failed to send Codex approval message:{_RESET} {exc}")
+                        decision = _APPROVAL_CANCEL if s.get("cancelled") else _APPROVAL_DENY
 
-            elif process.returncode is not None:
+                    codex_decision = _codex_approval_result(method, decision)
+
+                    if decision == _APPROVAL_APPROVE:
+                        log_info(f"{_GREEN}Approved:{_RESET} {label}")
+                    elif decision == _APPROVAL_CANCEL:
+                        log_info(f"{_RED}Cancelled:{_RESET} {label}")
+                    else:
+                        log_info(f"{_RED}Denied:{_RESET} {label}")
+
+                    await client.respond(
+                        event["id"],
+                        result={
+                            "decision": codex_decision,
+                        },
+                    )
+                    continue
+
+                if "id" in event and method == "item/tool/requestUserInput":
+                    last_host_request = method
+                    log_info(f"{_YELLOW}Codex requested unsupported user input; sending empty response.{_RESET}")
+                    await client.respond(event["id"], result={"answers": {}})
+                    continue
+
+                if "id" in event and method == "item/tool/call":
+                    last_host_request = f"{method}:{str(params.get('tool') or 'unknown')}"
+                    tool_name = str(params.get("tool") or "unknown")
+                    log_info(f"{_YELLOW}Codex dynamic tool request:{_RESET} {tool_name}")
+                    await client.respond(
+                        event["id"],
+                        result=_codex_dynamic_tool_result(tool_name),
+                    )
+                    continue
+
+                if "id" in event and method == "account/chatgptAuthTokens/refresh":
+                    last_host_request = method
+                    log_info(
+                        f"{_RED}Codex auth refresh request unsupported in Chatter:{_RESET} "
+                        f"{json.dumps(params, default=str)}"
+                    )
+                    await client.respond(
+                        event["id"],
+                        error={
+                            "code": -32601,
+                            "message": "ChatGPT auth token refresh is not supported in Chatter.",
+                        },
+                    )
+                    continue
+
+                if "id" in event:
+                    last_host_request = method
+                    summary = _tail(json.dumps(params, default=str), 400)
+                    log_info(
+                        f"{_RED}Unsupported Codex server request:{_RESET} "
+                        f"{method} {summary}"
+                    )
+                    await client.respond(
+                        event["id"],
+                        error={
+                            "code": -32601,
+                            "message": f"Unsupported Codex server request: {method}",
+                        },
+                    )
+                    continue
+
+                if method == "error":
+                    turn_error_text = _codex_error_text(params.get("error"))
+                    will_retry = bool(params.get("willRetry"))
+                    if turn_error_text:
+                        color = _YELLOW if will_retry else _RED
+                        prefix = "Codex turn warning" if will_retry else "Codex turn error"
+                        log_info(f"{color}{prefix}:{_RESET} {turn_error_text}")
+                    if will_retry:
+                        continue
+                    turn_status = "failed"
+                    if not turn_error_text:
+                        turn_error_text = "Codex app-server error."
+                    break
+
+                if method == "thread/started":
+                    thread = params.get("thread")
+                    if isinstance(thread, dict):
+                        started_thread_id = thread.get("id")
+                        if isinstance(started_thread_id, str) and started_thread_id:
+                            thread_id = started_thread_id
+                            session["session_id"] = thread_id
+                            session["session_started"] = True
+                    continue
+
+                if method == "turn/started":
+                    turn = params.get("turn")
+                    if isinstance(turn, dict):
+                        started_turn_id = turn.get("id")
+                        if isinstance(started_turn_id, str) and started_turn_id:
+                            turn_id = started_turn_id
+                    continue
+
+                if method == "item/started":
+                    item = params.get("item")
+                    if not isinstance(item, dict):
+                        continue
+
+                    item_id = str(item.get("id") or "")
+                    if item_id:
+                        known_items[item_id] = item
+
+                    item_type = item.get("type")
+                    if item_type == "commandExecution":
+                        current_command_item_id = item_id
+                        current_command = _display_shell_command(str(item.get("command") or ""))
+                        current_command_output = str(item.get("aggregatedOutput") or "")
+                        log_info(f"{_BLUE}Codex command:{_RESET} {current_command}")
+                    elif item_type == "dynamicToolCall":
+                        log_info(
+                            f"{_BLUE}Codex dynamic tool:{_RESET} "
+                            f"{item.get('tool', 'unknown')}"
+                        )
+                    continue
+
+                if method == "item/commandExecution/outputDelta":
+                    item_id = str(params.get("itemId") or "")
+                    if not item_id:
+                        continue
+                    command_outputs[item_id] = command_outputs.get(item_id, "") + str(params.get("delta") or "")
+                    if item_id == current_command_item_id:
+                        current_command_output = command_outputs[item_id]
+                    continue
+
+                if method == "item/agentMessage/delta":
+                    item_id = str(params.get("itemId") or "")
+                    if not item_id:
+                        continue
+                    agent_messages[item_id] = agent_messages.get(item_id, "") + str(params.get("delta") or "")
+                    latest_agent_message = agent_messages[item_id].strip()
+                    continue
+
+                if method == "item/completed":
+                    item = params.get("item")
+                    if not isinstance(item, dict):
+                        continue
+
+                    item_id = str(item.get("id") or "")
+                    if item_id:
+                        known_items[item_id] = item
+
+                    item_type = item.get("type")
+                    if item_type == "commandExecution":
+                        current_command_item_id = item_id
+                        current_command = _display_shell_command(str(item.get("command") or ""))
+                        current_command_output = str(item.get("aggregatedOutput") or current_command_output)
+                        exit_code = item.get("exitCode")
+                        log_info(
+                            f"{_BLUE}Codex command done:{_RESET} "
+                            f"exit={exit_code}  cmd={current_command}"
+                        )
+                    elif item_type == "agentMessage":
+                        text = str(item.get("text") or "").strip()
+                        if text:
+                            agent_messages[item_id] = text
+                            latest_agent_message = text
+                            log_info(f"{_YELLOW}Codex agent message:{_RESET} {len(text)} chars")
+                    elif item_type == "dynamicToolCall":
+                        log_info(
+                            f"{_BLUE}Codex dynamic tool done:{_RESET} "
+                            f"tool={item.get('tool', 'unknown')}  "
+                            f"status={item.get('status')}  success={item.get('success')}"
+                        )
+                    continue
+
+                if method == "turn/completed":
+                    turn = params.get("turn")
+                    if isinstance(turn, dict):
+                        completed_turn_id = turn.get("id")
+                        if isinstance(completed_turn_id, str) and completed_turn_id:
+                            turn_id = completed_turn_id
+                        turn_status = str(turn.get("status") or "")
+                        turn_error_text = _codex_turn_error_text(turn)
+                        if turn_status == "failed" and not turn_error_text:
+                            for known_item in reversed(list(known_items.values())):
+                                turn_error_text = _codex_failed_item_text(known_item)
+                                if turn_error_text:
+                                    break
+                        log_info(
+                            f"{_DIM}Codex turn completed:{_RESET} "
+                            f"status={turn_status or 'unknown'}  "
+                            f"error={_tail(turn_error_text or '', 300) or '(none)'}  "
+                            f"last_host_request={last_host_request or '(none)'}"
+                        )
+                    break
+
+            try:
+                now = asyncio.get_running_loop().time()
+                if now - last_edit >= EDIT_INTERVAL:
+                    elapsed = int(now - start_time)
+                    display = _codex_status_preview(
+                        latest_agent_message,
+                        current_command,
+                        current_command_output,
+                        elapsed,
+                    )
+                    await safe_edit(status_msg, display)
+                    last_edit = now
+            except Exception as exc:
+                turn_status = "failed"
+                turn_error_text = str(exc)
                 break
-
-            now = asyncio.get_running_loop().time()
-            if now - last_edit >= EDIT_INTERVAL:
-                elapsed = int(now - start_time)
-                display = _codex_status_preview(
-                    latest_agent_message,
-                    current_command,
-                    current_command_output,
-                    elapsed,
-                )
-                await safe_edit(status_msg, display)
-                last_edit = now
-
-        return_code = await process.wait()
     except asyncio.CancelledError:
         cancelled = True
         cancel_reason = s.get("cancel_reason") or cancel_reason
-        if process.returncode is None:
-            with suppress(ProcessLookupError):
-                process.kill()
-            with suppress(Exception):
-                await process.wait()
-    finally:
-        with suppress(asyncio.CancelledError):
-            await stderr_task
-        s["agent_process"] = None
+        if thread_id and turn_id:
+            await client.interrupt_turn(thread_id, turn_id)
+    except Exception as exc:
+        log_info(f"{_RED}Codex turn exception:{_RESET} {type(exc).__name__}: {exc}")
+        turn_status = "failed"
+        turn_error_text = str(exc)
 
     output = latest_agent_message or current_command_output.strip()
-    if return_code and not output and not cancelled:
-        stderr_output = _tail("\n".join(stderr_lines), 1200)
-        if stderr_output:
-            output = f"Error: Codex exited with code {return_code}\n\nstderr:\n{stderr_output}"
+    if turn_status == "failed" and not output:
+        if not turn_error_text and last_host_request:
+            turn_error_text = f"Codex turn failed after host request: {last_host_request}"
+        if turn_error_text:
+            output = f"Error: {turn_error_text}"
         else:
-            output = f"Error: Codex exited with code {return_code}"
+            output = "Error: Codex turn failed."
+    elif turn_status == "interrupted" and not cancelled:
+        cancelled = True
+        cancel_reason = s.get("cancel_reason") or cancel_reason
 
     return output, cancelled, cancel_reason
 
@@ -879,6 +1522,7 @@ async def _run_claude_turn(
     status_msg,
     start_time: float,
     s: dict,
+    session: dict[str, Any],
 ) -> tuple[str, bool, str]:
     """Run a single Claude SDK turn."""
     try:
@@ -921,10 +1565,10 @@ async def _run_claude_turn(
         stderr=_on_stderr,
     )
 
-    if s.get("session_id"):
-        options.resume = s["session_id"]
-        log_info(f"Resuming session {_BOLD}{s['session_id']}{_RESET}")
-    elif s.get("session_started"):
+    if session.get("session_id"):
+        options.resume = session["session_id"]
+        log_info(f"Resuming session {_BOLD}{session['session_id']}{_RESET}")
+    elif session.get("session_started"):
         options.continue_conversation = True
         log_info("Continuing conversation")
     else:
@@ -939,7 +1583,7 @@ async def _run_claude_turn(
 
     try:
         async with ClaudeSDKClient(options=options) as client:
-            await client.query(prompt, session_id=s.get("session_id") or "default")
+            await client.query(prompt, session_id=session.get("session_id") or "default")
 
             async for message in client.receive_response():
                 if s.get("cancelled"):
@@ -969,12 +1613,12 @@ async def _run_claude_turn(
                     log_info(f"{_YELLOW}AssistantMessage:{_RESET} {text_len} chars")
 
                 elif isinstance(message, ResultMessage):
-                    s["session_id"] = message.session_id or s.get("session_id")
+                    session["session_id"] = message.session_id or session.get("session_id")
                     result_text = message.result or ""
-                    s["session_started"] = True
+                    session["session_started"] = True
                     log_info(
                         f"{_GREEN}ResultMessage:{_RESET} "
-                        f"session={s['session_id']}  result={len(result_text)} chars"
+                        f"session={session['session_id']}  result={len(result_text)} chars"
                     )
 
                 elif isinstance(message, SystemMessage):
@@ -982,7 +1626,8 @@ async def _run_claude_turn(
                     if message.subtype == "init" and hasattr(message, "data"):
                         session_id = (message.data or {}).get("session_id")
                         if session_id:
-                            s["session_id"] = session_id
+                            session["session_id"] = session_id
+                            session["session_started"] = True
 
                 now = asyncio.get_running_loop().time()
                 if now - last_edit >= EDIT_INTERVAL:
@@ -1023,13 +1668,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     async with lock:
         prompt = update.message.text
         log_user(update.effective_user.id, prompt)
+        backend = _active_backend(s)
+        session = _get_backend_session(s, backend)
 
-        if not await _ensure_agent_auth(update):
+        if not await _ensure_agent_auth(update, backend):
             s["running"] = False
             s["run_task"] = None
             return
 
         s["running"] = True
+        s["running_backend"] = backend
         s["cancelled"] = False
         s["cancel_reason"] = None
         s["run_task"] = asyncio.current_task()
@@ -1043,12 +1691,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cancel_reason = "Cancelled."
 
         try:
-            if _config.agent_backend == AGENT_CODEX:
+            if backend == AGENT_CODEX:
                 output, cancelled, cancel_reason = await _run_codex_turn(
                     prompt,
+                    chat_id,
+                    context.bot,
                     status_msg,
                     start_time,
                     s,
+                    session,
                 )
             else:
                 output, cancelled, cancel_reason = await _run_claude_turn(
@@ -1058,6 +1709,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     status_msg,
                     start_time,
                     s,
+                    session,
                 )
         finally:
             stop_typing.set()
@@ -1069,9 +1721,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 s["run_task"] = None
             s["agent_process"] = None
             s["running"] = False
+            s["running_backend"] = None
             s["cancelled"] = False
             s["cancel_reason"] = None
-            log_info(f"Done. session={s.get('session_id')}  out={len(output)}")
+            log_info(
+                f"Done. backend={backend}  session={session.get('session_id')}  out={len(output)}"
+            )
 
         if cancelled and not output:
             if cancel_reason == _INTERRUPT_REASON:
@@ -1099,16 +1754,16 @@ def run_bot(config: BotConfig) -> None:
         agent_backend=config.agent_backend,
     )
 
-    if _config.agent_backend == AGENT_CLAUDE:
-        # The SDK closes stdin after this timeout (ms) if it hasn't received a result.
-        # Default 60 s is too short when waiting for human approval on Telegram.
-        os.environ.setdefault(
-            "CLAUDE_CODE_STREAM_CLOSE_TIMEOUT",
-            str(APPROVAL_TIMEOUT * 1000 + 60_000),
-        )
+    # Claude can be selected later via /agent even when it is not the repo default.
+    # Keep the extended timeout configured whenever the bot is running.
+    os.environ.setdefault(
+        "CLAUDE_CODE_STREAM_CLOSE_TIMEOUT",
+        str(APPROVAL_TIMEOUT * 1000 + 60_000),
+    )
 
     app = Application.builder().token(_config.bot_token).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("agent", agent_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CallbackQueryHandler(_approval_callback))
