@@ -117,6 +117,15 @@ class TestAuditLogger:
         assert logs[0]["event"] == "approval_decision"
         assert logs[0]["decision"] == "approved"
 
+    def test_log_approval_session_memory_decisions(self, log_dir: Path, logger: AuditLogger):
+        logger.log_approval(chat_id=1, tool_name="Bash", decision="approved_for_session")
+        logger.log_approval(chat_id=1, tool_name="Bash", decision="auto_approved_session")
+        logs = self._read_logs(log_dir)
+        assert [entry["decision"] for entry in logs] == [
+            "approved_for_session",
+            "auto_approved_session",
+        ]
+
     def test_log_scope_violation(self, log_dir: Path, logger: AuditLogger):
         logger.log_scope_violation(
             chat_id=1,

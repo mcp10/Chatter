@@ -110,6 +110,7 @@ MAX_APPROVAL_PREVIEW = 1200  # keep approval prompts comfortably under Telegram 
 _APPROVAL_APPROVE = "approve"
 _APPROVAL_DENY = "deny"
 _APPROVAL_CANCEL = "cancel"
+_APPROVAL_APPROVE_SESSION = "approve_session"
 
 # Tools that are auto-approved (read-only / non-destructive)
 SAFE_TOOLS: set[str] = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite"}
@@ -117,6 +118,7 @@ SAFE_TOOLS: set[str] = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWr
 # Callback data prefixes for approval inline keyboard buttons
 _CB_APPROVE = "ap"
 _CB_DENY    = "dn"
+_CB_APPROVE_SESSION = "as"
 _CB_INPUT_CHOICE = "ui"
 _CB_INPUT_CANCEL = "uc"
 
@@ -135,7 +137,13 @@ def _new_backend_session() -> dict[str, Any]:
     return {
         "session_id": None,
         "session_started": False,
+        "approved_command_keys": set(),
     }
+
+
+def _reset_backend_session_state(session: dict[str, Any]) -> None:
+    session.clear()
+    session.update(_new_backend_session())
 
 
 def _active_backend(s: dict[str, Any]) -> str:
@@ -153,7 +161,9 @@ def _get_backend_session(s: dict[str, Any], backend: str) -> dict[str, Any]:
 
 
 def _reset_backend_session(s: dict[str, Any], backend: str) -> None:
-    s.setdefault("backend_sessions", {})[backend] = _new_backend_session()
+    sessions = s.setdefault("backend_sessions", {})
+    session = sessions.setdefault(backend, _new_backend_session())
+    _reset_backend_session_state(session)
 
 
 def _describe_backend_session(s: dict[str, Any], backend: str) -> str:
@@ -567,6 +577,120 @@ class ApprovalRequestError(RuntimeError):
     """Raised when the Telegram approval prompt cannot be delivered."""
 
 
+def _approved_command_keys(session: dict[str, Any]) -> set[str]:
+    keys = session.get("approved_command_keys")
+    if isinstance(keys, set):
+        return keys
+    if isinstance(keys, (list, tuple)):
+        normalized = {str(key) for key in keys}
+    else:
+        normalized = set()
+    session["approved_command_keys"] = normalized
+    return normalized
+
+
+def _remember_approved_command(session: dict[str, Any], command_key: str | None) -> None:
+    if command_key is None:
+        return
+    _approved_command_keys(session).add(command_key)
+
+
+def _is_approved_command(session: dict[str, Any], command_key: str | None) -> bool:
+    if command_key is None:
+        return False
+    return command_key in _approved_command_keys(session)
+
+
+def _claude_command_approval_key(
+    tool_name: str,
+    input_data: dict[str, Any],
+) -> str | None:
+    if tool_name != "Bash":
+        return None
+    return str(input_data.get("command", "")).strip()
+
+
+def _codex_command_approval_key(method: str, params: dict[str, Any]) -> str | None:
+    if method not in {"item/commandExecution/requestApproval", "execCommandApproval"}:
+        return None
+
+    network_context = params.get("networkApprovalContext")
+    if isinstance(network_context, dict) and network_context:
+        return None
+
+    command = params.get("command")
+    if isinstance(command, list):
+        rendered = shlex.join([str(part) for part in command])
+    else:
+        rendered = str(command or "")
+    return _display_shell_command(rendered).strip()
+
+
+def _log_approval_decision(chat_id: int, tool_name: str, decision: str) -> None:
+    if _audit:
+        _audit.log_approval(chat_id, tool_name, decision)
+
+
+async def _decide_telegram_approval(
+    chat_id: int,
+    bot,
+    *,
+    session: dict[str, Any],
+    label: str,
+    text: str,
+    audit_tool_name: str,
+    command_key: str | None,
+) -> str:
+    if _is_approved_command(session, command_key):
+        log_info(f"{_GREEN}Auto-approved for session:{_RESET} {label}")
+        _log_approval_decision(chat_id, audit_tool_name, "auto_approved_session")
+        return _APPROVAL_APPROVE
+
+    decision = await _request_telegram_approval(
+        chat_id,
+        bot,
+        label=label,
+        text=text,
+        allow_session_approve=command_key is not None,
+    )
+
+    if decision == _APPROVAL_APPROVE_SESSION:
+        _remember_approved_command(session, command_key)
+        log_info(f"{_GREEN}Approved for session:{_RESET} {label}")
+        _log_approval_decision(chat_id, audit_tool_name, "approved_for_session")
+    elif decision == _APPROVAL_APPROVE:
+        log_info(f"{_GREEN}Approved:{_RESET} {label}")
+        _log_approval_decision(chat_id, audit_tool_name, "approved")
+    elif decision == _APPROVAL_CANCEL:
+        log_info(f"{_RED}Cancelled:{_RESET} {label}")
+        _log_approval_decision(chat_id, audit_tool_name, "cancelled")
+    else:
+        log_info(f"{_RED}Denied:{_RESET} {label}")
+        _log_approval_decision(chat_id, audit_tool_name, "denied")
+
+    return decision
+
+
+async def _decide_codex_approval(
+    chat_id: int,
+    bot,
+    *,
+    session: dict[str, Any],
+    method: str,
+    params: dict[str, Any],
+    known_item: dict[str, Any] | None,
+) -> str:
+    return await _decide_telegram_approval(
+        chat_id,
+        bot,
+        session=session,
+        label=_codex_approval_label(method),
+        text=_format_codex_approval_request(method, params, known_item),
+        audit_tool_name=_codex_approval_label(method),
+        command_key=_codex_command_approval_key(method, params),
+    )
+
+
 def _format_tool_request(tool_name: str, input_data: dict[str, Any]) -> str:
     """Format a tool approval request for Telegram display."""
     parts = [f"<b>Tool: {_html.escape(tool_name)}</b>\n"]
@@ -733,13 +857,13 @@ def _codex_approval_label(method: str) -> str:
 
 def _codex_approval_result(method: str, decision: str) -> str:
     if method in {"execCommandApproval", "applyPatchApproval"}:
-        if decision == _APPROVAL_APPROVE:
+        if decision in {_APPROVAL_APPROVE, _APPROVAL_APPROVE_SESSION}:
             return "approved"
         if decision == _APPROVAL_CANCEL:
             return "abort"
         return "denied"
 
-    if decision == _APPROVAL_APPROVE:
+    if decision in {_APPROVAL_APPROVE, _APPROVAL_APPROVE_SESSION}:
         return "accept"
     if decision == _APPROVAL_CANCEL:
         return "cancel"
@@ -993,18 +1117,29 @@ async def _request_telegram_approval(
     *,
     label: str,
     text: str,
+    allow_session_approve: bool = False,
 ) -> str:
     s = get_state(chat_id)
     approval_id = uuid.uuid4().hex[:8]
     future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
     s["pending_approvals"][approval_id] = future
 
-    keyboard = InlineKeyboardMarkup([
-        [
+    if allow_session_approve:
+        keyboard_rows = [[
+            InlineKeyboardButton("Approve once", callback_data=f"{_CB_APPROVE}:{approval_id}"),
+            InlineKeyboardButton(
+                "Approve for session",
+                callback_data=f"{_CB_APPROVE_SESSION}:{approval_id}",
+            ),
+            InlineKeyboardButton("Deny", callback_data=f"{_CB_DENY}:{approval_id}"),
+        ]]
+    else:
+        keyboard_rows = [[
             InlineKeyboardButton("Approve", callback_data=f"{_CB_APPROVE}:{approval_id}"),
             InlineKeyboardButton("Deny", callback_data=f"{_CB_DENY}:{approval_id}"),
-        ]
-    ])
+        ]]
+
+    keyboard = InlineKeyboardMarkup(keyboard_rows)
 
     try:
         await bot.send_message(
@@ -1045,7 +1180,7 @@ async def _request_telegram_approval(
     return decision
 
 
-def _make_can_use_tool(chat_id: int, bot):
+def _make_can_use_tool(chat_id: int, bot, session: dict[str, Any]):
     """Factory that creates a can_use_tool callback bound to a specific chat."""
     from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
@@ -1077,17 +1212,18 @@ def _make_can_use_tool(chat_id: int, bot):
         # Auto-approve safe tools
         if tool_name in SAFE_TOOLS:
             log_info(f"{_GREEN}Auto-approved:{_RESET} {tool_name}")
-            if _audit:
-                _audit.log_approval(chat_id, tool_name, "auto_approved")
+            _log_approval_decision(chat_id, tool_name, "auto_approved")
             return PermissionResultAllow(updated_input=input_data)
 
-        text = _format_tool_request(tool_name, input_data)
         try:
-            decision = await _request_telegram_approval(
+            decision = await _decide_telegram_approval(
                 chat_id,
                 bot,
+                session=session,
                 label=tool_name,
-                text=text,
+                text=_format_tool_request(tool_name, input_data),
+                audit_tool_name=tool_name,
+                command_key=_claude_command_approval_key(tool_name, input_data),
             )
         except ApprovalRequestError as exc:
             log_info(f"{_RED}Failed to send approval message:{_RESET} {exc}")
@@ -1095,20 +1231,11 @@ def _make_can_use_tool(chat_id: int, bot):
                 _audit.log_error(chat_id, f"Approval request failed: {exc}")
             return PermissionResultDeny(message=str(exc))
 
-        if decision == _APPROVAL_APPROVE:
-            log_info(f"{_GREEN}Approved:{_RESET} {tool_name}")
-            if _audit:
-                _audit.log_approval(chat_id, tool_name, "approved")
+        if decision in {_APPROVAL_APPROVE, _APPROVAL_APPROVE_SESSION}:
             return PermissionResultAllow(updated_input=input_data)
         elif decision == _APPROVAL_CANCEL:
-            log_info(f"{_RED}Cancelled:{_RESET} {tool_name}")
-            if _audit:
-                _audit.log_approval(chat_id, tool_name, "cancelled")
             return PermissionResultDeny(message=f"User cancelled {tool_name}")
         else:
-            log_info(f"{_RED}Denied:{_RESET} {tool_name}")
-            if _audit:
-                _audit.log_approval(chat_id, tool_name, "denied")
             return PermissionResultDeny(message=f"User denied {tool_name}")
 
     return can_use_tool
@@ -1204,13 +1331,24 @@ async def _approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = update.effective_chat.id
     s = get_state(chat_id)
 
-    if data.startswith(f"{_CB_APPROVE}:") or data.startswith(f"{_CB_DENY}:"):
+    if (
+        data.startswith(f"{_CB_APPROVE}:")
+        or data.startswith(f"{_CB_APPROVE_SESSION}:")
+        or data.startswith(f"{_CB_DENY}:")
+    ):
         prefix, approval_id = data.split(":", 1)
-        decision = _APPROVAL_APPROVE if prefix == _CB_APPROVE else _APPROVAL_DENY
+        if prefix == _CB_APPROVE:
+            decision = _APPROVAL_APPROVE
+            label = "APPROVED"
+        elif prefix == _CB_APPROVE_SESSION:
+            decision = _APPROVAL_APPROVE_SESSION
+            label = "APPROVED FOR SESSION"
+        else:
+            decision = _APPROVAL_DENY
+            label = "DENIED"
         future = s["pending_approvals"].get(approval_id)
         if future and not future.done():
             future.set_result(decision)
-            label = "APPROVED" if decision == _APPROVAL_APPROVE else "DENIED"
             try:
                 await cb.edit_message_text(
                     f"{cb.message.text_html}\n\n<b>{label}</b>",
@@ -1518,8 +1656,7 @@ async def _run_codex_turn(
                 log_info(
                     f"{_YELLOW}Codex resume failed; starting fresh instead:{_RESET} {exc}"
                 )
-                session["session_id"] = None
-                session["session_started"] = False
+                _reset_backend_session_state(session)
                 thread_id = ""
 
         if not thread_id:
@@ -1599,27 +1736,20 @@ async def _run_codex_turn(
                 }:
                     last_host_request = method
                     known_item = known_items.get(str(params.get("itemId") or ""))
-                    text = _format_codex_approval_request(method, params, known_item)
-                    label = _codex_approval_label(method)
                     try:
-                        decision = await _request_telegram_approval(
+                        decision = await _decide_codex_approval(
                             chat_id,
                             bot,
-                            label=label,
-                            text=text,
+                            session=session,
+                            method=method,
+                            params=params,
+                            known_item=known_item,
                         )
                     except ApprovalRequestError as exc:
                         log_info(f"{_RED}Failed to send Codex approval message:{_RESET} {exc}")
                         decision = _APPROVAL_CANCEL if s.get("cancelled") else _APPROVAL_DENY
 
                     codex_decision = _codex_approval_result(method, decision)
-
-                    if decision == _APPROVAL_APPROVE:
-                        log_info(f"{_GREEN}Approved:{_RESET} {label}")
-                    elif decision == _APPROVAL_CANCEL:
-                        log_info(f"{_RED}Cancelled:{_RESET} {label}")
-                    else:
-                        log_info(f"{_RED}Denied:{_RESET} {label}")
 
                     await client.respond(
                         event["id"],
@@ -1899,7 +2029,7 @@ async def _run_claude_turn(
 
     options = ClaudeAgentOptions(
         cwd=cwd,
-        can_use_tool=_make_can_use_tool(chat_id, bot),
+        can_use_tool=_make_can_use_tool(chat_id, bot, session),
         include_partial_messages=True,
         setting_sources=["project", "local"],
         add_dirs=[cwd],
