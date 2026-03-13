@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import html as _html
-import os
 import json
+import os
 import re
 import shlex
 import uuid
@@ -14,10 +14,9 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import colorama
-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, RetryAfter
@@ -37,6 +36,7 @@ from .agent import (
     agent_label,
     normalize_agent_backend,
 )
+from .audit import AuditLogger
 from .claude_auth import format_claude_auth_error, get_claude_auth_status
 from .codex_app_server import CodexAppServerClient, CodexAppServerError
 from .codex_auth import format_codex_auth_error, get_codex_auth_status
@@ -54,6 +54,7 @@ class BotConfig:
     agent_backend: str
 
 _config: BotConfig | None = None
+_audit: AuditLogger | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +110,7 @@ MAX_APPROVAL_PREVIEW = 1200  # keep approval prompts comfortably under Telegram 
 _APPROVAL_APPROVE = "approve"
 _APPROVAL_DENY = "deny"
 _APPROVAL_CANCEL = "cancel"
+_APPROVAL_APPROVE_SESSION = "approve_session"
 
 # Tools that are auto-approved (read-only / non-destructive)
 SAFE_TOOLS: set[str] = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite"}
@@ -116,6 +118,7 @@ SAFE_TOOLS: set[str] = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWr
 # Callback data prefixes for approval inline keyboard buttons
 _CB_APPROVE = "ap"
 _CB_DENY    = "dn"
+_CB_APPROVE_SESSION = "as"
 _CB_INPUT_CHOICE = "ui"
 _CB_INPUT_CANCEL = "uc"
 
@@ -127,32 +130,44 @@ _INTERRUPT_REASON = "Interrupted by a newer prompt."
 # Per-chat state
 # ---------------------------------------------------------------------------
 
-_state: dict = {}
+_state: dict[int, dict[str, Any]] = {}
+
+
+def _require_config() -> BotConfig:
+    if _config is None:
+        raise RuntimeError("Bot config not initialized")
+    return _config
 
 
 def _new_backend_session() -> dict[str, Any]:
     return {
         "session_id": None,
         "session_started": False,
+        "approved_command_keys": set(),
     }
+
+
+def _reset_backend_session_state(session: dict[str, Any]) -> None:
+    session.clear()
+    session.update(_new_backend_session())
 
 
 def _active_backend(s: dict[str, Any]) -> str:
     override = s.get("backend_override")
-    if override:
+    if isinstance(override, str) and override:
         return override
-    if _config is None:
-        raise RuntimeError("Bot config not initialized")
-    return _config.agent_backend
+    return _require_config().agent_backend
 
 
 def _get_backend_session(s: dict[str, Any], backend: str) -> dict[str, Any]:
-    sessions = s.setdefault("backend_sessions", {})
+    sessions = cast(dict[str, dict[str, Any]], s.setdefault("backend_sessions", {}))
     return sessions.setdefault(backend, _new_backend_session())
 
 
 def _reset_backend_session(s: dict[str, Any], backend: str) -> None:
-    s.setdefault("backend_sessions", {})[backend] = _new_backend_session()
+    sessions = s.setdefault("backend_sessions", {})
+    session = sessions.setdefault(backend, _new_backend_session())
+    _reset_backend_session_state(session)
 
 
 def _describe_backend_session(s: dict[str, Any], backend: str) -> str:
@@ -163,7 +178,8 @@ def _describe_backend_session(s: dict[str, Any], backend: str) -> str:
 
 
 def _format_agent_status(s: dict[str, Any]) -> str:
-    default_backend = _config.agent_backend
+    config = _require_config()
+    default_backend = config.agent_backend
     active_backend = _active_backend(s)
     override = s.get("backend_override")
     lines = [
@@ -185,10 +201,11 @@ def _format_agent_status(s: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def get_state(chat_id: int) -> dict:
+def get_state(chat_id: int) -> dict[str, Any]:
     if chat_id not in _state:
+        config = _require_config()
         _state[chat_id] = {
-            "cwd": _config.repo_path,
+            "cwd": config.repo_path,
             "lock": asyncio.Lock(),
             "running": False,
             "running_backend": None,
@@ -213,21 +230,22 @@ def is_allowed(update: Update) -> bool:
     chat = update.effective_chat
     if _config is None or user is None or chat is None:
         return False
-    return user.id == _config.allowed_user_id and chat.type == "private"
+    allowed = bool(user.id == _config.allowed_user_id and chat.type == "private")
+    if not allowed and _audit is not None:
+        _audit.log_auth_failure(user.id, chat.type)
+    return allowed
 
 
 _PATH_KEYS = {"path", "file_path", "cwd", "notebook_path", "root_path"}
 _PATH_LIST_KEYS = {"paths", "file_paths"}
 _GLOB_META_CHARS = set("*?[]{}")
 _EMBEDDED_ABS_PATH_RE = re.compile(
-    r"(?:^|[\\s'\"=:(,\\[{])(/[^\\s'\"`|&;()<>]+|~(?:/[^\\s'\"`|&;()<>]*)?)"
+    r"(?:^|[\s'\"=:(,\[{])(/[^\s'\"`|&;()<>]+|~(?:/[^\s'\"`|&;()<>]*)?)"
 )
 
 
 def _repo_root() -> Path:
-    if _config is None:
-        raise RuntimeError("Bot config not initialized")
-    return Path(_config.repo_path).resolve()
+    return Path(_require_config().repo_path).resolve()
 
 
 def _resolve_candidate_path(raw_path: str, repo_root: Path) -> Path:
@@ -335,7 +353,7 @@ def _repo_scope_violation(tool_name: str, input_data: dict[str, Any]) -> str | N
     for raw_path in _iter_tool_paths(tool_name, input_data):
         resolved = _resolve_candidate_path(raw_path, repo_root)
         if not _is_within_repo(resolved, repo_root):
-            return f"{tool_name} requested '{raw_path}', which is outside {_config.repo_path}."
+            return f"{tool_name} requested '{raw_path}', which is outside {repo_root}."
 
     return None
 
@@ -523,14 +541,14 @@ async def _ensure_codex_auth(update: Update) -> bool:
 
 async def _available_backend_note(current_backend: str) -> str | None:
     if current_backend == AGENT_CODEX:
-        status = await asyncio.to_thread(get_claude_auth_status)
-        if status.ok:
+        claude_status = await asyncio.to_thread(get_claude_auth_status)
+        if claude_status.ok:
             return "Claude Code is available via /agent claude."
         return None
 
     if current_backend == AGENT_CLAUDE:
-        status = await asyncio.to_thread(get_codex_auth_status)
-        if status.ok:
+        codex_status = await asyncio.to_thread(get_codex_auth_status)
+        if codex_status.ok:
             return "Codex is available via /agent codex."
         return None
 
@@ -561,6 +579,120 @@ def _get_codex_client(s: dict[str, Any]) -> CodexAppServerClient:
 
 class ApprovalRequestError(RuntimeError):
     """Raised when the Telegram approval prompt cannot be delivered."""
+
+
+def _approved_command_keys(session: dict[str, Any]) -> set[str]:
+    keys = session.get("approved_command_keys")
+    if isinstance(keys, set):
+        return keys
+    if isinstance(keys, list | tuple):
+        normalized = {str(key) for key in keys}
+    else:
+        normalized = set()
+    session["approved_command_keys"] = normalized
+    return normalized
+
+
+def _remember_approved_command(session: dict[str, Any], command_key: str | None) -> None:
+    if command_key is None:
+        return
+    _approved_command_keys(session).add(command_key)
+
+
+def _is_approved_command(session: dict[str, Any], command_key: str | None) -> bool:
+    if command_key is None:
+        return False
+    return command_key in _approved_command_keys(session)
+
+
+def _claude_command_approval_key(
+    tool_name: str,
+    input_data: dict[str, Any],
+) -> str | None:
+    if tool_name != "Bash":
+        return None
+    return str(input_data.get("command", "")).strip()
+
+
+def _codex_command_approval_key(method: str, params: dict[str, Any]) -> str | None:
+    if method not in {"item/commandExecution/requestApproval", "execCommandApproval"}:
+        return None
+
+    network_context = params.get("networkApprovalContext")
+    if isinstance(network_context, dict) and network_context:
+        return None
+
+    command = params.get("command")
+    if isinstance(command, list):
+        rendered = shlex.join([str(part) for part in command])
+    else:
+        rendered = str(command or "")
+    return _display_shell_command(rendered).strip()
+
+
+def _log_approval_decision(chat_id: int, tool_name: str, decision: str) -> None:
+    if _audit:
+        _audit.log_approval(chat_id, tool_name, decision)
+
+
+async def _decide_telegram_approval(
+    chat_id: int,
+    bot,
+    *,
+    session: dict[str, Any],
+    label: str,
+    text: str,
+    audit_tool_name: str,
+    command_key: str | None,
+) -> str:
+    if _is_approved_command(session, command_key):
+        log_info(f"{_GREEN}Auto-approved for session:{_RESET} {label}")
+        _log_approval_decision(chat_id, audit_tool_name, "auto_approved_session")
+        return _APPROVAL_APPROVE
+
+    decision = await _request_telegram_approval(
+        chat_id,
+        bot,
+        label=label,
+        text=text,
+        allow_session_approve=command_key is not None,
+    )
+
+    if decision == _APPROVAL_APPROVE_SESSION:
+        _remember_approved_command(session, command_key)
+        log_info(f"{_GREEN}Approved for session:{_RESET} {label}")
+        _log_approval_decision(chat_id, audit_tool_name, "approved_for_session")
+    elif decision == _APPROVAL_APPROVE:
+        log_info(f"{_GREEN}Approved:{_RESET} {label}")
+        _log_approval_decision(chat_id, audit_tool_name, "approved")
+    elif decision == _APPROVAL_CANCEL:
+        log_info(f"{_RED}Cancelled:{_RESET} {label}")
+        _log_approval_decision(chat_id, audit_tool_name, "cancelled")
+    else:
+        log_info(f"{_RED}Denied:{_RESET} {label}")
+        _log_approval_decision(chat_id, audit_tool_name, "denied")
+
+    return decision
+
+
+async def _decide_codex_approval(
+    chat_id: int,
+    bot,
+    *,
+    session: dict[str, Any],
+    method: str,
+    params: dict[str, Any],
+    known_item: dict[str, Any] | None,
+) -> str:
+    return await _decide_telegram_approval(
+        chat_id,
+        bot,
+        session=session,
+        label=_codex_approval_label(method),
+        text=_format_codex_approval_request(method, params, known_item),
+        audit_tool_name=_codex_approval_label(method),
+        command_key=_codex_command_approval_key(method, params),
+    )
 
 
 def _format_tool_request(tool_name: str, input_data: dict[str, Any]) -> str:
@@ -729,13 +861,13 @@ def _codex_approval_label(method: str) -> str:
 
 def _codex_approval_result(method: str, decision: str) -> str:
     if method in {"execCommandApproval", "applyPatchApproval"}:
-        if decision == _APPROVAL_APPROVE:
+        if decision in {_APPROVAL_APPROVE, _APPROVAL_APPROVE_SESSION}:
             return "approved"
         if decision == _APPROVAL_CANCEL:
             return "abort"
         return "denied"
 
-    if decision == _APPROVAL_APPROVE:
+    if decision in {_APPROVAL_APPROVE, _APPROVAL_APPROVE_SESSION}:
         return "accept"
     if decision == _APPROVAL_CANCEL:
         return "cancel"
@@ -876,7 +1008,7 @@ async def _request_codex_user_input(
     chat_id: int,
     bot,
     questions: list[dict[str, Any]],
-) -> dict[str, dict[str, list[str]]] | None:
+) -> dict[str, Any] | None:
     answers: dict[str, dict[str, list[str]]] = {}
     total = len(questions)
 
@@ -989,18 +1121,29 @@ async def _request_telegram_approval(
     *,
     label: str,
     text: str,
+    allow_session_approve: bool = False,
 ) -> str:
     s = get_state(chat_id)
     approval_id = uuid.uuid4().hex[:8]
     future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
     s["pending_approvals"][approval_id] = future
 
-    keyboard = InlineKeyboardMarkup([
-        [
+    if allow_session_approve:
+        keyboard_rows = [[
+            InlineKeyboardButton("Approve once", callback_data=f"{_CB_APPROVE}:{approval_id}"),
+            InlineKeyboardButton(
+                "Approve for session",
+                callback_data=f"{_CB_APPROVE_SESSION}:{approval_id}",
+            ),
+            InlineKeyboardButton("Deny", callback_data=f"{_CB_DENY}:{approval_id}"),
+        ]]
+    else:
+        keyboard_rows = [[
             InlineKeyboardButton("Approve", callback_data=f"{_CB_APPROVE}:{approval_id}"),
             InlineKeyboardButton("Deny", callback_data=f"{_CB_DENY}:{approval_id}"),
-        ]
-    ])
+        ]]
+
+    keyboard = InlineKeyboardMarkup(keyboard_rows)
 
     try:
         await bot.send_message(
@@ -1041,7 +1184,7 @@ async def _request_telegram_approval(
     return decision
 
 
-def _make_can_use_tool(chat_id: int, bot):
+def _make_can_use_tool(chat_id: int, bot, session: dict[str, Any]):
     """Factory that creates a can_use_tool callback bound to a specific chat."""
     from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
@@ -1059,38 +1202,44 @@ def _make_can_use_tool(chat_id: int, bot):
         tool_name: str, input_data: dict[str, Any]
     ) -> PermissionResultAllow | PermissionResultDeny:
         log_info(f"{_YELLOW}Tool request:{_RESET} {tool_name}")
+        if _audit:
+            _audit.log_tool_request(chat_id, tool_name, input_data)
         s = get_state(chat_id)
 
         violation = _repo_scope_violation(tool_name, input_data)
         if violation:
             log_info(f"{_RED}Blocked (outside repo):{_RESET} {tool_name} - {violation}")
+            if _audit:
+                _audit.log_scope_violation(chat_id, tool_name, violation)
             return PermissionResultDeny(message=violation)
 
         # Auto-approve safe tools
         if tool_name in SAFE_TOOLS:
             log_info(f"{_GREEN}Auto-approved:{_RESET} {tool_name}")
+            _log_approval_decision(chat_id, tool_name, "auto_approved")
             return PermissionResultAllow(updated_input=input_data)
 
-        text = _format_tool_request(tool_name, input_data)
         try:
-            decision = await _request_telegram_approval(
+            decision = await _decide_telegram_approval(
                 chat_id,
                 bot,
+                session=session,
                 label=tool_name,
-                text=text,
+                text=_format_tool_request(tool_name, input_data),
+                audit_tool_name=tool_name,
+                command_key=_claude_command_approval_key(tool_name, input_data),
             )
         except ApprovalRequestError as exc:
             log_info(f"{_RED}Failed to send approval message:{_RESET} {exc}")
+            if _audit:
+                _audit.log_error(chat_id, f"Approval request failed: {exc}")
             return PermissionResultDeny(message=str(exc))
 
-        if decision == _APPROVAL_APPROVE:
-            log_info(f"{_GREEN}Approved:{_RESET} {tool_name}")
+        if decision in {_APPROVAL_APPROVE, _APPROVAL_APPROVE_SESSION}:
             return PermissionResultAllow(updated_input=input_data)
         elif decision == _APPROVAL_CANCEL:
-            log_info(f"{_RED}Cancelled:{_RESET} {tool_name}")
             return PermissionResultDeny(message=f"User cancelled {tool_name}")
         else:
-            log_info(f"{_RED}Denied:{_RESET} {tool_name}")
             return PermissionResultDeny(message=f"User denied {tool_name}")
 
     return can_use_tool
@@ -1186,13 +1335,24 @@ async def _approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = update.effective_chat.id
     s = get_state(chat_id)
 
-    if data.startswith(f"{_CB_APPROVE}:") or data.startswith(f"{_CB_DENY}:"):
+    if (
+        data.startswith(f"{_CB_APPROVE}:")
+        or data.startswith(f"{_CB_APPROVE_SESSION}:")
+        or data.startswith(f"{_CB_DENY}:")
+    ):
         prefix, approval_id = data.split(":", 1)
-        decision = _APPROVAL_APPROVE if prefix == _CB_APPROVE else _APPROVAL_DENY
+        if prefix == _CB_APPROVE:
+            decision = _APPROVAL_APPROVE
+            label = "APPROVED"
+        elif prefix == _CB_APPROVE_SESSION:
+            decision = _APPROVAL_APPROVE_SESSION
+            label = "APPROVED FOR SESSION"
+        else:
+            decision = _APPROVAL_DENY
+            label = "DENIED"
         future = s["pending_approvals"].get(approval_id)
         if future and not future.done():
             future.set_result(decision)
-            label = "APPROVED" if decision == _APPROVAL_APPROVE else "DENIED"
             try:
                 await cb.edit_message_text(
                     f"{cb.message.text_html}\n\n<b>{label}</b>",
@@ -1284,9 +1444,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     s = get_state(update.effective_chat.id)
     label = agent_label(_active_backend(s))
+    config = _require_config()
     await update.message.reply_text(
         f"{label} agent bridge ready.\n"
-        f"Repo: {_config.repo_name} ({s['cwd']})\n\n"
+        f"Repo: {config.repo_name} ({s['cwd']})\n\n"
         f"/agent  — show or switch backend\n"
         f"/cancel  — stop the running agent\n"
         f"/new     — start a fresh conversation\n\n"
@@ -1324,6 +1485,7 @@ async def agent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     s = get_state(update.effective_chat.id)
+    config = _require_config()
     args = context.args or []
     if not args:
         await update.message.reply_text(_format_agent_status(s))
@@ -1337,7 +1499,7 @@ async def agent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     use_default = raw_target.lower() == "default"
     try:
         target_backend = (
-            _config.agent_backend
+            config.agent_backend
             if use_default
             else normalize_agent_backend(raw_target)
         )
@@ -1356,7 +1518,7 @@ async def agent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reason=f"Backend switched to {agent_label(target_backend)}.",
         )
 
-    s["backend_override"] = None if target_backend == _config.agent_backend else target_backend
+    s["backend_override"] = None if target_backend == config.agent_backend else target_backend
 
     if previous_backend == target_backend:
         message = _format_agent_status(s)
@@ -1500,8 +1662,7 @@ async def _run_codex_turn(
                 log_info(
                     f"{_YELLOW}Codex resume failed; starting fresh instead:{_RESET} {exc}"
                 )
-                session["session_id"] = None
-                session["session_started"] = False
+                _reset_backend_session_state(session)
                 thread_id = ""
 
         if not thread_id:
@@ -1581,27 +1742,20 @@ async def _run_codex_turn(
                 }:
                     last_host_request = method
                     known_item = known_items.get(str(params.get("itemId") or ""))
-                    text = _format_codex_approval_request(method, params, known_item)
-                    label = _codex_approval_label(method)
                     try:
-                        decision = await _request_telegram_approval(
+                        decision = await _decide_codex_approval(
                             chat_id,
                             bot,
-                            label=label,
-                            text=text,
+                            session=session,
+                            method=method,
+                            params=params,
+                            known_item=known_item,
                         )
                     except ApprovalRequestError as exc:
                         log_info(f"{_RED}Failed to send Codex approval message:{_RESET} {exc}")
                         decision = _APPROVAL_CANCEL if s.get("cancelled") else _APPROVAL_DENY
 
                     codex_decision = _codex_approval_result(method, decision)
-
-                    if decision == _APPROVAL_APPROVE:
-                        log_info(f"{_GREEN}Approved:{_RESET} {label}")
-                    elif decision == _APPROVAL_CANCEL:
-                        log_info(f"{_RED}Cancelled:{_RESET} {label}")
-                    else:
-                        log_info(f"{_RED}Denied:{_RESET} {label}")
 
                     await client.respond(
                         event["id"],
@@ -1881,7 +2035,7 @@ async def _run_claude_turn(
 
     options = ClaudeAgentOptions(
         cwd=cwd,
-        can_use_tool=_make_can_use_tool(chat_id, bot),
+        can_use_tool=_make_can_use_tool(chat_id, bot, session),
         include_partial_messages=True,
         setting_sources=["project", "local"],
         add_dirs=[cwd],
@@ -1999,6 +2153,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     async with lock:
         prompt = update.message.text
         log_user(update.effective_user.id, prompt)
+        if _audit:
+            _audit.log_message(chat_id, update.effective_user.id, prompt)
         backend = _active_backend(s)
         session = _get_backend_session(s, backend)
 
@@ -2076,7 +2232,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ---------------------------------------------------------------------------
 
 def run_bot(config: BotConfig) -> None:
-    global _config
+    global _config, _audit
     repo_root = str(Path(config.repo_path).resolve())
     _config = BotConfig(
         bot_token=config.bot_token,
@@ -2101,5 +2257,7 @@ def run_bot(config: BotConfig) -> None:
     app.add_handler(CallbackQueryHandler(_approval_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    _audit = AuditLogger()
+    _audit.log_startup(_config.allowed_user_id, _config.repo_path, _config.agent_backend)
     log_startup(_config.allowed_user_id, _config.repo_path, _config.agent_backend)
     app.run_polling(drop_pending_updates=True)

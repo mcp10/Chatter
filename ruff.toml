@@ -1,0 +1,34 @@
+# Ruff linting configuration for Chatter
+# https://docs.astral.sh/ruff/
+
+target-version = "py310"
+line-length = 120
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort (import sorting)
+    "UP",   # pyupgrade (modern Python idioms)
+    "B",    # flake8-bugbear (common bug patterns)
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter if needed)
+    "SIM108", # ternary operator suggestion (readability preference)
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["B011"]  # allow assert False in tests
+# Pre-existing files: suppress style issues that would require larger refactoring
+"chatter/bot.py" = [
+    "SIM105",  # try/except/pass → contextlib.suppress
+    "B904",    # raise from inside except
+    "B905",    # zip strict parameter
+    "F841",    # unused variable (get_state call kept for side effects)
+    "UP035",   # deprecated import
+    "UP037",   # quoted annotation
+]
+"chatter/cli.py" = ["I001", "B904", "UP037"]
+"chatter/codex_app_server.py" = ["SIM105", "UP035"]
