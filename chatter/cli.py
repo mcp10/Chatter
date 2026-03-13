@@ -10,7 +10,7 @@ import click
 
 from .agent import AGENT_CLAUDE, AGENT_CODEX, SUPPORTED_AGENT_BACKENDS, agent_label
 from .claude_auth import format_claude_auth_error, get_claude_auth_status
-from .config import GLOBAL_CONFIG_FILE, ChatterConfig
+from .config import GLOBAL_CONFIG_FILE, ChatterConfig, RepoEntry
 from .codex_auth import format_codex_auth_error, get_codex_auth_status
 from .notify import send_startup_notification
 
@@ -60,17 +60,17 @@ def _suggest_agent_backend() -> str:
 def _ensure_agent_auth(agent_backend: str) -> None:
     """Fail fast when the selected local agent CLI is unavailable or logged out."""
     if agent_backend == AGENT_CODEX:
-        auth_status = get_codex_auth_status()
-        if not auth_status.ok:
-            raise click.ClickException(format_codex_auth_error(auth_status))
+        codex_auth_status = get_codex_auth_status()
+        if not codex_auth_status.ok:
+            raise click.ClickException(format_codex_auth_error(codex_auth_status))
         return
 
-    auth_status = get_claude_auth_status()
-    if not auth_status.ok:
-        raise click.ClickException(format_claude_auth_error(auth_status))
+    claude_auth_status = get_claude_auth_status()
+    if not claude_auth_status.ok:
+        raise click.ClickException(format_claude_auth_error(claude_auth_status))
 
 
-def _load_repo_config() -> tuple[ChatterConfig, str, "RepoEntry"]:  # noqa: F821
+def _load_repo_config() -> tuple[ChatterConfig, str, RepoEntry]:
     """Load config and find the repo matching cwd."""
     cfg = _load_config()
     try:

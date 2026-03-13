@@ -14,7 +14,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import colorama
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -130,7 +130,13 @@ _INTERRUPT_REASON = "Interrupted by a newer prompt."
 # Per-chat state
 # ---------------------------------------------------------------------------
 
-_state: dict = {}
+_state: dict[int, dict[str, Any]] = {}
+
+
+def _require_config() -> BotConfig:
+    if _config is None:
+        raise RuntimeError("Bot config not initialized")
+    return _config
 
 
 def _new_backend_session() -> dict[str, Any]:
@@ -148,15 +154,13 @@ def _reset_backend_session_state(session: dict[str, Any]) -> None:
 
 def _active_backend(s: dict[str, Any]) -> str:
     override = s.get("backend_override")
-    if override:
+    if isinstance(override, str) and override:
         return override
-    if _config is None:
-        raise RuntimeError("Bot config not initialized")
-    return _config.agent_backend
+    return _require_config().agent_backend
 
 
 def _get_backend_session(s: dict[str, Any], backend: str) -> dict[str, Any]:
-    sessions = s.setdefault("backend_sessions", {})
+    sessions = cast(dict[str, dict[str, Any]], s.setdefault("backend_sessions", {}))
     return sessions.setdefault(backend, _new_backend_session())
 
 
@@ -174,7 +178,8 @@ def _describe_backend_session(s: dict[str, Any], backend: str) -> str:
 
 
 def _format_agent_status(s: dict[str, Any]) -> str:
-    default_backend = _config.agent_backend
+    config = _require_config()
+    default_backend = config.agent_backend
     active_backend = _active_backend(s)
     override = s.get("backend_override")
     lines = [
@@ -196,10 +201,11 @@ def _format_agent_status(s: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def get_state(chat_id: int) -> dict:
+def get_state(chat_id: int) -> dict[str, Any]:
     if chat_id not in _state:
+        config = _require_config()
         _state[chat_id] = {
-            "cwd": _config.repo_path,
+            "cwd": config.repo_path,
             "lock": asyncio.Lock(),
             "running": False,
             "running_backend": None,
@@ -224,7 +230,7 @@ def is_allowed(update: Update) -> bool:
     chat = update.effective_chat
     if _config is None or user is None or chat is None:
         return False
-    allowed = user.id == _config.allowed_user_id and chat.type == "private"
+    allowed = bool(user.id == _config.allowed_user_id and chat.type == "private")
     if not allowed and _audit is not None:
         _audit.log_auth_failure(user.id, chat.type)
     return allowed
@@ -239,9 +245,7 @@ _EMBEDDED_ABS_PATH_RE = re.compile(
 
 
 def _repo_root() -> Path:
-    if _config is None:
-        raise RuntimeError("Bot config not initialized")
-    return Path(_config.repo_path).resolve()
+    return Path(_require_config().repo_path).resolve()
 
 
 def _resolve_candidate_path(raw_path: str, repo_root: Path) -> Path:
@@ -349,7 +353,7 @@ def _repo_scope_violation(tool_name: str, input_data: dict[str, Any]) -> str | N
     for raw_path in _iter_tool_paths(tool_name, input_data):
         resolved = _resolve_candidate_path(raw_path, repo_root)
         if not _is_within_repo(resolved, repo_root):
-            return f"{tool_name} requested '{raw_path}', which is outside {_config.repo_path}."
+            return f"{tool_name} requested '{raw_path}', which is outside {repo_root}."
 
     return None
 
@@ -537,14 +541,14 @@ async def _ensure_codex_auth(update: Update) -> bool:
 
 async def _available_backend_note(current_backend: str) -> str | None:
     if current_backend == AGENT_CODEX:
-        status = await asyncio.to_thread(get_claude_auth_status)
-        if status.ok:
+        claude_status = await asyncio.to_thread(get_claude_auth_status)
+        if claude_status.ok:
             return "Claude Code is available via /agent claude."
         return None
 
     if current_backend == AGENT_CLAUDE:
-        status = await asyncio.to_thread(get_codex_auth_status)
-        if status.ok:
+        codex_status = await asyncio.to_thread(get_codex_auth_status)
+        if codex_status.ok:
             return "Codex is available via /agent codex."
         return None
 
@@ -581,7 +585,7 @@ def _approved_command_keys(session: dict[str, Any]) -> set[str]:
     keys = session.get("approved_command_keys")
     if isinstance(keys, set):
         return keys
-    if isinstance(keys, (list, tuple)):
+    if isinstance(keys, list | tuple):
         normalized = {str(key) for key in keys}
     else:
         normalized = set()
@@ -1004,7 +1008,7 @@ async def _request_codex_user_input(
     chat_id: int,
     bot,
     questions: list[dict[str, Any]],
-) -> dict[str, dict[str, list[str]]] | None:
+) -> dict[str, Any] | None:
     answers: dict[str, dict[str, list[str]]] = {}
     total = len(questions)
 
@@ -1440,9 +1444,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     s = get_state(update.effective_chat.id)
     label = agent_label(_active_backend(s))
+    config = _require_config()
     await update.message.reply_text(
         f"{label} agent bridge ready.\n"
-        f"Repo: {_config.repo_name} ({s['cwd']})\n\n"
+        f"Repo: {config.repo_name} ({s['cwd']})\n\n"
         f"/agent  — show or switch backend\n"
         f"/cancel  — stop the running agent\n"
         f"/new     — start a fresh conversation\n\n"
@@ -1480,6 +1485,7 @@ async def agent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     s = get_state(update.effective_chat.id)
+    config = _require_config()
     args = context.args or []
     if not args:
         await update.message.reply_text(_format_agent_status(s))
@@ -1493,7 +1499,7 @@ async def agent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     use_default = raw_target.lower() == "default"
     try:
         target_backend = (
-            _config.agent_backend
+            config.agent_backend
             if use_default
             else normalize_agent_backend(raw_target)
         )
@@ -1512,7 +1518,7 @@ async def agent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reason=f"Backend switched to {agent_label(target_backend)}.",
         )
 
-    s["backend_override"] = None if target_backend == _config.agent_backend else target_backend
+    s["backend_override"] = None if target_backend == config.agent_backend else target_backend
 
     if previous_backend == target_backend:
         message = _format_agent_status(s)

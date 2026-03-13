@@ -26,6 +26,20 @@ Thank you for your interest in contributing to Chatter! This guide will help you
 Before submitting a PR, make sure all checks pass:
 
 ```bash
+# Run all checks
+make check
+
+# Or run checks individually
+make guardrails
+make lint
+make typecheck
+make test
+make audit
+```
+
+Equivalent direct commands:
+
+```bash
 # Run tests
 pytest tests/ -v
 
